@@ -463,6 +463,19 @@ fn evdev_listener_loop(
                 }
             }
 
+            // Track shift state for post-processing toggle
+            if key == Key::KEY_LEFTSHIFT || key == Key::KEY_RIGHTSHIFT {
+                match value {
+                    1 => {
+                        active_modifiers.insert(key);
+                    }
+                    0 => {
+                        active_modifiers.remove(&key);
+                    }
+                    _ => {}
+                }
+            }
+
             // Track model modifier state
             if let Some(mm) = model_modifier {
                 if key == mm {
@@ -492,7 +505,22 @@ fn evdev_listener_loop(
                     modifier_keys.iter().all(|m| active_modifiers.contains(m));
 
                 if modifiers_satisfied {
+                    // Check if Shift is held (toggle post-processing)
+                    let shift_held = active_modifiers.contains(&Key::KEY_LEFTSHIFT)
+                        || active_modifiers.contains(&Key::KEY_RIGHTSHIFT);
+
                     match value {
+                        1 if !is_pressed && shift_held => {
+                            // Shift+hotkey press: toggle post-processing
+                            is_pressed = true;
+                            tracing::debug!("Shift+hotkey pressed: toggle post-processing");
+                            if tx
+                                .blocking_send(HotkeyEvent::TogglePostProcess)
+                                .is_err()
+                            {
+                                return Ok(()); // Channel closed
+                            }
+                        }
                         1 if !is_pressed => {
                             // Key press (not repeat)
                             is_pressed = true;
