@@ -86,10 +86,17 @@ impl AnthropicPostProcessor {
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": 1024,
+            "system": [
+                {
+                    "type": "text",
+                    "text": self.prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
             "messages": [
                 {
                     "role": "user",
-                    "content": format!("{}\n\n{}", self.prompt, text)
+                    "content": text
                 }
             ]
         });
