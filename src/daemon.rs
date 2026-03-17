@@ -14,6 +14,7 @@ use crate::model_manager::ModelManager;
 use crate::output;
 use crate::output::anthropic::AnthropicPostProcessor;
 use crate::output::post_process::PostProcessor;
+use crate::tray;
 use crate::state::{ChunkResult, State};
 use crate::text::TextProcessor;
 use crate::transcribe::Transcriber;
@@ -477,6 +478,10 @@ pub struct Daemon {
     text_processor: TextProcessor,
     post_processor: Option<PostProcessor>,
     anthropic_processor: Option<AnthropicPostProcessor>,
+    post_processing_enabled: bool,
+    tray_handle: Option<tray::TrayHandle>,
+    tray_action_rx: Option<tokio::sync::mpsc::UnboundedReceiver<tray::TrayAction>>,
+    tray_state_tx: Option<tokio::sync::watch::Sender<tray::TrayState>>,
     // Model manager for multi-model support
     model_manager: Option<ModelManager>,
     // Background task for loading model on-demand
@@ -617,6 +622,9 @@ impl Daemon {
             None
         };
 
+        let post_processing_enabled =
+            anthropic_processor.is_some() || post_processor.is_some();
+
         Self {
             config,
             config_path,
@@ -625,7 +633,11 @@ impl Daemon {
             audio_feedback,
             text_processor,
             post_processor,
+            post_processing_enabled,
             anthropic_processor,
+            tray_handle: None,
+            tray_action_rx: None,
+            tray_state_tx: None,
             model_manager: None,
             model_load_task: None,
             transcription_task: None,
@@ -649,10 +661,18 @@ impl Daemon {
         }
     }
 
-    /// Update the state file if configured
+    /// Update the state file and tray icon if configured
     fn update_state(&self, state_name: &str) {
         if let Some(ref path) = self.state_file_path {
             write_state_file(path, state_name);
+        }
+        if let Some(ref tx) = self.tray_state_tx {
+            let tray_state = match state_name {
+                "recording" => tray::TrayState::Recording,
+                "transcribing" => tray::TrayState::Transcribing,
+                _ => tray::TrayState::Idle,
+            };
+            let _ = tx.send(tray_state);
         }
     }
 
@@ -1337,31 +1357,40 @@ impl Daemon {
                             result
                         } else {
                             // Profile exists but has no post_process_command, use default
-                            if let Some(ref anthropic_processor) = self.anthropic_processor {
-                                tracing::info!("Post-processing via Anthropic: {:?}", processed_text);
-                                let result = anthropic_processor.process(&processed_text).await;
-                                tracing::info!("Post-processed: {:?}", result);
-                                result
-                            } else if let Some(ref post_processor) = self.post_processor {
-                                tracing::info!("Post-processing: {:?}", processed_text);
-                                let result = post_processor.process(&processed_text).await;
-                                tracing::info!("Post-processed: {:?}", result);
-                                result
+                            if self.post_processing_enabled {
+                                if let Some(ref anthropic_processor) = self.anthropic_processor {
+                                    tracing::info!("Post-processing via Anthropic: {:?}", processed_text);
+                                    let result = anthropic_processor.process(&processed_text).await;
+                                    tracing::info!("Post-processed: {:?}", result);
+                                    result
+                                } else if let Some(ref post_processor) = self.post_processor {
+                                    tracing::info!("Post-processing: {:?}", processed_text);
+                                    let result = post_processor.process(&processed_text).await;
+                                    tracing::info!("Post-processed: {:?}", result);
+                                    result
+                                } else {
+                                    processed_text
+                                }
                             } else {
                                 processed_text
                             }
                         }
-                    } else if let Some(ref anthropic_processor) = self.anthropic_processor {
-                        tracing::info!("Post-processing via Anthropic: {:?}", processed_text);
-                        let result = anthropic_processor.process(&processed_text).await;
-                        tracing::info!("Post-processed: {:?}", result);
-                        result
-                    } else if let Some(ref post_processor) = self.post_processor {
-                        tracing::info!("Post-processing: {:?}", processed_text);
-                        let result = post_processor.process(&processed_text).await;
-                        tracing::info!("Post-processed: {:?}", result);
-                        result
+                    } else if self.post_processing_enabled {
+                        if let Some(ref anthropic_processor) = self.anthropic_processor {
+                            tracing::info!("Post-processing via Anthropic: {:?}", processed_text);
+                            let result = anthropic_processor.process(&processed_text).await;
+                            tracing::info!("Post-processed: {:?}", result);
+                            result
+                        } else if let Some(ref post_processor) = self.post_processor {
+                            tracing::info!("Post-processing: {:?}", processed_text);
+                            let result = post_processor.process(&processed_text).await;
+                            tracing::info!("Post-processed: {:?}", result);
+                            result
+                        } else {
+                            processed_text
+                        }
                     } else {
+                        tracing::debug!("Post-processing disabled, using raw transcription");
                         processed_text
                     };
 
@@ -1647,6 +1676,25 @@ impl Daemon {
         } else {
             None
         };
+
+        // Start system tray icon
+        if let Some((handle, action_rx)) =
+            tray::spawn_tray(self.post_processing_enabled).await
+        {
+            // Set up watch channel for state updates (sync -> async bridge)
+            let (state_tx, mut state_rx) =
+                tokio::sync::watch::channel(tray::TrayState::Idle);
+            let tray_handle_clone = handle.clone_for_watcher();
+            tokio::spawn(async move {
+                while state_rx.changed().await.is_ok() {
+                    let state = state_rx.borrow().clone();
+                    tray_handle_clone.set_state(state).await;
+                }
+            });
+            self.tray_state_tx = Some(state_tx);
+            self.tray_handle = Some(handle);
+            self.tray_action_rx = Some(action_rx);
+        }
 
         // Current state
         let mut state = State::Idle;
@@ -2043,6 +2091,27 @@ impl Daemon {
                         (HotkeyEvent::Released, ActivationMode::Toggle) => {
                             // In toggle mode, we ignore key release events
                             tracing::trace!("Ignoring HotkeyEvent::Released in toggle mode");
+                        }
+
+                        // === TOGGLE POST-PROCESSING (Shift+hotkey) ===
+                        (HotkeyEvent::TogglePostProcess, _) => {
+                            self.post_processing_enabled = !self.post_processing_enabled;
+                            let status = if self.post_processing_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            };
+                            tracing::info!("Post-processing {}", status);
+                            if let Some(ref handle) = self.tray_handle {
+                                handle.set_post_processing(self.post_processing_enabled).await;
+                            }
+                            send_notification(
+                                "Post-Processing",
+                                &format!("Post-processing {}", status),
+                                self.config.output.notification.show_engine_icon,
+                                self.config.engine,
+                            )
+                            .await;
                         }
 
                         // === CANCEL KEY (works in both modes) ===
@@ -2641,6 +2710,32 @@ impl Daemon {
                             // Channel closed
                             tracing::debug!("Meeting event channel closed");
                             self.meeting_event_rx = None;
+                        }
+                    }
+                }
+
+                // Handle tray menu actions
+                Some(action) = async {
+                    match &mut self.tray_action_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match action {
+                        tray::TrayAction::TogglePostProcessing => {
+                            self.post_processing_enabled = !self.post_processing_enabled;
+                            let status = if self.post_processing_enabled { "enabled" } else { "disabled" };
+                            tracing::info!("Post-processing {} (via tray)", status);
+                            send_notification(
+                                "Post-Processing",
+                                &format!("Post-processing {}", status),
+                                self.config.output.notification.show_engine_icon,
+                                self.config.engine,
+                            ).await;
+                        }
+                        tray::TrayAction::Quit => {
+                            tracing::info!("Quit requested via tray");
+                            break;
                         }
                     }
                 }

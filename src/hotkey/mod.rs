@@ -24,6 +24,8 @@ pub enum HotkeyEvent {
     Released,
     /// The cancel key was pressed (abort recording/transcription)
     Cancel,
+    /// Toggle post-processing on/off (Shift+hotkey tap)
+    TogglePostProcess,
 }
 
 /// Trait for hotkey detection implementations
