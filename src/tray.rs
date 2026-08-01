@@ -44,7 +44,10 @@ impl ksni::Tray for VoxtypeTray {
         match self.state {
             TrayState::Idle => "audio-input-microphone".into(),
             TrayState::Recording => "media-record".into(),
-            TrayState::Transcribing => "document-edit".into(),
+            // "view-refresh" is in the freedesktop icon naming spec; "document-edit"
+            // is a KDE-only name that is missing from Mint-X, Adwaita and hicolor,
+            // which left the tray blank while transcribing.
+            TrayState::Transcribing => "view-refresh".into(),
         }
     }
 
@@ -75,6 +78,31 @@ impl ksni::Tray for VoxtypeTray {
         }
     }
 
+    fn watcher_online(&self) {
+        tracing::info!("StatusNotifierWatcher online, tray icon registered");
+    }
+
+    /// Keep the tray service alive when the watcher is missing.
+    ///
+    /// The daemon usually starts before the desktop session has claimed
+    /// `org.kde.StatusNotifierWatcher`, so treat an absent watcher as
+    /// temporary and wait for it to appear instead of giving up.
+    fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
+        match reason {
+            ksni::OfflineReason::No => {
+                tracing::info!("StatusNotifierWatcher went away, waiting for it to return")
+            }
+            reason => tracing::info!(
+                "StatusNotifierWatcher unavailable ({}), waiting for it to appear",
+                match reason {
+                    ksni::OfflineReason::Error(e) => e.to_string(),
+                    _ => "unknown".into(),
+                }
+            ),
+        }
+        true
+    }
+
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
 
@@ -97,9 +125,7 @@ impl ksni::Tray for VoxtypeTray {
                 checked: self.post_processing_enabled,
                 activate: Box::new(|this: &mut Self| {
                     this.post_processing_enabled = !this.post_processing_enabled;
-                    let _ = this
-                        .action_tx
-                        .send(TrayAction::TogglePostProcessing);
+                    let _ = this.action_tx.send(TrayAction::TogglePostProcessing);
                 }),
                 ..Default::default()
             }
@@ -164,7 +190,10 @@ pub async fn spawn_tray(
         action_tx,
     };
 
-    match tray.spawn().await {
+    // `assume_sni_available` keeps the service running when the watcher is not
+    // on the bus yet. It re-registers automatically once the watcher appears,
+    // which covers both a slow desktop session start and a shell restart.
+    match tray.assume_sni_available(true).spawn().await {
         Ok(handle) => {
             tracing::info!("System tray icon started");
             Some((TrayHandle { handle }, action_rx))
