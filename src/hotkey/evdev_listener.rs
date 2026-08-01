@@ -514,10 +514,7 @@ fn evdev_listener_loop(
                             // Shift+hotkey press: toggle post-processing
                             is_pressed = true;
                             tracing::debug!("Shift+hotkey pressed: toggle post-processing");
-                            if tx
-                                .blocking_send(HotkeyEvent::TogglePostProcess)
-                                .is_err()
-                            {
+                            if tx.blocking_send(HotkeyEvent::TogglePostProcess).is_err() {
                                 return Ok(()); // Channel closed
                             }
                         }

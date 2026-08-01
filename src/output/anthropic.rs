@@ -55,9 +55,7 @@ impl AnthropicPostProcessor {
         match timeout(self.timeout, self.call_api(text)).await {
             Ok(Ok(processed)) => {
                 if processed.is_empty() {
-                    tracing::warn!(
-                        "Anthropic API returned empty response, using original text"
-                    );
+                    tracing::warn!("Anthropic API returned empty response, using original text");
                     text.to_string()
                 } else {
                     tracing::debug!(
@@ -101,30 +99,29 @@ impl AnthropicPostProcessor {
             ]
         });
 
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|e| AnthropicError::Request(e.to_string()))?;
+        let body_bytes =
+            serde_json::to_vec(&body).map_err(|e| AnthropicError::Request(e.to_string()))?;
 
         // Use ureq in a blocking task to avoid blocking the async runtime
         let api_key = self.api_key.clone();
         let timeout_secs = self.timeout.as_secs().max(5);
-        let response: Result<String, AnthropicError> =
-            tokio::task::spawn_blocking(move || {
-                let agent = ureq::AgentBuilder::new()
-                    .timeout(std::time::Duration::from_secs(timeout_secs))
-                    .build();
-                let resp = agent
-                    .post("https://api.anthropic.com/v1/messages")
-                    .set("x-api-key", &api_key)
-                    .set("anthropic-version", "2023-06-01")
-                    .set("content-type", "application/json")
-                    .send_bytes(&body_bytes)
-                    .map_err(|e| AnthropicError::Request(e.to_string()))?;
+        let response: Result<String, AnthropicError> = tokio::task::spawn_blocking(move || {
+            let agent = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(timeout_secs))
+                .build();
+            let resp = agent
+                .post("https://api.anthropic.com/v1/messages")
+                .set("x-api-key", &api_key)
+                .set("anthropic-version", "2023-06-01")
+                .set("content-type", "application/json")
+                .send_bytes(&body_bytes)
+                .map_err(|e| AnthropicError::Request(e.to_string()))?;
 
-                resp.into_string()
-                    .map_err(|e| AnthropicError::Response(e.to_string()))
-            })
-            .await
-            .map_err(|e| AnthropicError::Request(e.to_string()))?;
+            resp.into_string()
+                .map_err(|e| AnthropicError::Response(e.to_string()))
+        })
+        .await
+        .map_err(|e| AnthropicError::Request(e.to_string()))?;
 
         let response_str = response?;
         let response_body: serde_json::Value = serde_json::from_str(&response_str)
@@ -144,10 +141,7 @@ impl AnthropicPostProcessor {
                 } else {
                     body_str
                 };
-                AnthropicError::Response(format!(
-                    "unexpected response structure: {}",
-                    truncated
-                ))
+                AnthropicError::Response(format!("unexpected response structure: {}", truncated))
             })?;
 
         Ok(result.trim().to_string())
