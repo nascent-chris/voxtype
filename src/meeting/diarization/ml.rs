@@ -10,8 +10,11 @@ use crate::meeting::data::AudioSource;
 use crate::meeting::TranscriptSegment;
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(feature = "ml-diarization")]
 use std::sync::Mutex;
 
+#[cfg(feature = "ml-diarization")]
+use ort::ep;
 #[cfg(feature = "ml-diarization")]
 use ort::session::Session;
 #[cfg(feature = "ml-diarization")]
@@ -124,14 +127,29 @@ impl MlDiarizer {
         }
 
         match Session::builder() {
-            Ok(builder) => match builder.commit_from_file(&path) {
-                Ok(session) => {
-                    self.session = Some(Mutex::new(session));
-                    tracing::info!("Loaded speaker embedding model: {:?}", path);
-                    Ok(())
+            Ok(builder) => {
+                #[cfg(feature = "ml-diarization-cuda")]
+                let builder = builder
+                    .with_execution_providers([ep::CUDA::default().build()])
+                    .map_err(|e| format!("Failed to configure CUDA execution provider: {}", e))?;
+
+                match builder.commit_from_file(&path) {
+                    Ok(session) => {
+                        self.session = Some(Mutex::new(session));
+                        tracing::info!(
+                            "Loaded speaker embedding model: {:?}{}",
+                            path,
+                            if cfg!(feature = "ml-diarization-cuda") {
+                                " with CUDA"
+                            } else {
+                                ""
+                            }
+                        );
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("Failed to load model: {}", e)),
                 }
-                Err(e) => Err(format!("Failed to load model: {}", e)),
-            },
+            }
             Err(e) => Err(format!("Failed to create ONNX session: {}", e)),
         }
     }
@@ -140,12 +158,13 @@ impl MlDiarizer {
     #[cfg(feature = "ml-diarization")]
     pub fn extract_embedding(&self, samples: &[f32]) -> Result<Vec<f32>, String> {
         let mutex = self.session.as_ref().ok_or("Model not loaded")?;
-        let mut session = mutex.lock().map_err(|e| format!("Session lock poisoned: {}", e))?;
+        let mut session = mutex
+            .lock()
+            .map_err(|e| format!("Session lock poisoned: {}", e))?;
 
         // Prepare input tensor: [batch=1, samples]
-        let input_tensor =
-            Tensor::<f32>::from_array(([1usize, samples.len()], samples.to_vec()))
-                .map_err(|e| format!("Failed to create input tensor: {}", e))?;
+        let input_tensor = Tensor::<f32>::from_array(([1usize, samples.len()], samples.to_vec()))
+            .map_err(|e| format!("Failed to create input tensor: {}", e))?;
 
         // Run inference
         let outputs = session
@@ -233,9 +252,12 @@ impl Default for MlDiarizer {
 }
 
 impl Diarizer for MlDiarizer {
+    // `samples` is only read by the ml-diarization branch below
+    #[cfg_attr(not(feature = "ml-diarization"), allow(unused_variables))]
     fn diarize(
-        &self,
+        &mut self,
         samples: &[f32],
+        _chunk_start_ms: u64,
         _source: AudioSource,
         transcript_segments: &[TranscriptSegment],
     ) -> Vec<DiarizedSegment> {
@@ -335,6 +357,12 @@ impl Diarizer for MlDiarizer {
 
     fn name(&self) -> &'static str {
         "ml"
+    }
+
+    fn reset(&mut self) {
+        self.speaker_embeddings.clear();
+        self.speaker_labels.clear();
+        self.next_speaker_id = 0;
     }
 }
 

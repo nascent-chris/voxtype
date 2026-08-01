@@ -1318,13 +1318,37 @@ pub struct MeetingDiarizationConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Diarization backend: "simple", "ml", or "remote"
+    /// Diarization backend: "simple", "embedding", "ml", or "remote"
     #[serde(default = "default_diarization_backend")]
     pub backend: String,
 
     /// Maximum number of speakers to detect
     #[serde(default = "default_max_speakers")]
     pub max_speakers: u32,
+
+    /// Named local speaker embedding model to use when backend = "embedding"
+    #[serde(default = "default_meeting_diarization_model")]
+    pub model: String,
+
+    /// Optional absolute path to a custom speaker embedding model
+    #[serde(default)]
+    pub model_path: Option<String>,
+
+    /// Minimum speech duration needed for speaker identification
+    #[serde(default = "default_min_segment_ms")]
+    pub min_segment_ms: u64,
+
+    /// Maximum audio window to feed into the embedding model
+    #[serde(default = "default_embedding_window_secs")]
+    pub window_secs: f32,
+
+    /// Similarity threshold for confidently matching an existing speaker
+    #[serde(default = "default_confident_threshold")]
+    pub confident_threshold: f32,
+
+    /// Similarity threshold for reusing an existing speaker at lower confidence
+    #[serde(default = "default_uncertain_threshold")]
+    pub uncertain_threshold: f32,
 }
 
 fn default_diarization_backend() -> String {
@@ -1333,6 +1357,26 @@ fn default_diarization_backend() -> String {
 
 fn default_max_speakers() -> u32 {
     10
+}
+
+fn default_meeting_diarization_model() -> String {
+    "wespeaker-resnet221-lm".to_string()
+}
+
+fn default_min_segment_ms() -> u64 {
+    500
+}
+
+fn default_embedding_window_secs() -> f32 {
+    1.5
+}
+
+fn default_confident_threshold() -> f32 {
+    0.30
+}
+
+fn default_uncertain_threshold() -> f32 {
+    0.15
 }
 
 fn default_chunk_duration() -> u32 {
@@ -1353,6 +1397,12 @@ impl Default for MeetingDiarizationConfig {
             enabled: true,
             backend: default_diarization_backend(),
             max_speakers: default_max_speakers(),
+            model: default_meeting_diarization_model(),
+            model_path: None,
+            min_segment_ms: default_min_segment_ms(),
+            window_secs: default_embedding_window_secs(),
+            confident_threshold: default_confident_threshold(),
+            uncertain_threshold: default_uncertain_threshold(),
         }
     }
 }
@@ -3444,6 +3494,12 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.backend, "simple");
         assert_eq!(config.max_speakers, 10);
+        assert_eq!(config.model, "wespeaker-resnet221-lm");
+        assert_eq!(config.model_path, None);
+        assert_eq!(config.min_segment_ms, 500);
+        assert_eq!(config.window_secs, 1.5);
+        assert_eq!(config.confident_threshold, 0.30);
+        assert_eq!(config.uncertain_threshold, 0.15);
     }
 
     #[test]
@@ -3526,8 +3582,14 @@ mod tests {
 
             [meeting.diarization]
             enabled = false
-            backend = "ml"
+            backend = "embedding"
             max_speakers = 5
+            model = "wespeaker-resnet34"
+            model_path = "/tmp/speaker.onnx"
+            min_segment_ms = 750
+            window_secs = 2.0
+            confident_threshold = 0.42
+            uncertain_threshold = 0.24
 
             [meeting.summary]
             backend = "local"
@@ -3539,8 +3601,17 @@ mod tests {
         assert_eq!(config.meeting.audio.mic_device, "hw:1");
         assert_eq!(config.meeting.audio.loopback_device, "disabled");
         assert!(!config.meeting.diarization.enabled);
-        assert_eq!(config.meeting.diarization.backend, "ml");
+        assert_eq!(config.meeting.diarization.backend, "embedding");
         assert_eq!(config.meeting.diarization.max_speakers, 5);
+        assert_eq!(config.meeting.diarization.model, "wespeaker-resnet34");
+        assert_eq!(
+            config.meeting.diarization.model_path.as_deref(),
+            Some("/tmp/speaker.onnx")
+        );
+        assert_eq!(config.meeting.diarization.min_segment_ms, 750);
+        assert_eq!(config.meeting.diarization.window_secs, 2.0);
+        assert_eq!(config.meeting.diarization.confident_threshold, 0.42);
+        assert_eq!(config.meeting.diarization.uncertain_threshold, 0.24);
         assert_eq!(config.meeting.summary.backend, "local");
         assert_eq!(config.meeting.summary.ollama_model, "mistral");
         assert_eq!(config.meeting.summary.timeout_secs, 60);

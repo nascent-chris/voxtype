@@ -24,6 +24,7 @@ pub mod worker;
     feature = "paraformer",
     feature = "dolphin",
     feature = "omnilingual",
+    feature = "speaker-embedding",
 ))]
 pub mod fbank;
 

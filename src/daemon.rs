@@ -14,10 +14,10 @@ use crate::model_manager::ModelManager;
 use crate::output;
 use crate::output::anthropic::AnthropicPostProcessor;
 use crate::output::post_process::PostProcessor;
-use crate::tray;
 use crate::state::{ChunkResult, State};
 use crate::text::TextProcessor;
 use crate::transcribe::Transcriber;
+use crate::tray;
 use pidlock::Pidlock;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -508,6 +508,8 @@ pub struct Daemon {
     // Chunk buffers for meeting mode (separate mic and loopback)
     meeting_mic_buffer: Vec<f32>,
     meeting_loopback_buffer: Vec<f32>,
+    meeting_mic_processed_samples: u64,
+    meeting_loopback_processed_samples: u64,
     // Meeting event receiver
     meeting_event_rx: Option<tokio::sync::mpsc::Receiver<MeetingEvent>>,
     // GTCRN speech enhancer for mic echo cancellation
@@ -622,8 +624,7 @@ impl Daemon {
             None
         };
 
-        let post_processing_enabled =
-            anthropic_processor.is_some() || post_processor.is_some();
+        let post_processing_enabled = anthropic_processor.is_some() || post_processor.is_some();
 
         Self {
             config,
@@ -648,6 +649,8 @@ impl Daemon {
             meeting_audio_capture: None,
             meeting_mic_buffer: Vec::new(),
             meeting_loopback_buffer: Vec::new(),
+            meeting_mic_processed_samples: 0,
+            meeting_loopback_processed_samples: 0,
             meeting_event_rx: None,
             #[cfg(feature = "onnx-common")]
             speech_enhancer: None,
@@ -777,6 +780,17 @@ impl Daemon {
             },
             retain_audio: self.config.meeting.retain_audio,
             max_duration_mins: self.config.meeting.max_duration_mins,
+            diarization: meeting::diarization::DiarizationConfig {
+                enabled: self.config.meeting.diarization.enabled,
+                backend: self.config.meeting.diarization.backend.clone(),
+                max_speakers: self.config.meeting.diarization.max_speakers,
+                model: self.config.meeting.diarization.model.clone(),
+                min_segment_ms: self.config.meeting.diarization.min_segment_ms,
+                window_secs: self.config.meeting.diarization.window_secs,
+                confident_threshold: self.config.meeting.diarization.confident_threshold,
+                uncertain_threshold: self.config.meeting.diarization.uncertain_threshold,
+                model_path: self.config.meeting.diarization.model_path.clone(),
+            },
         };
 
         // Create event channel
@@ -849,6 +863,8 @@ impl Daemon {
                         self.meeting_daemon = Some(daemon);
                         self.meeting_mic_buffer.clear();
                         self.meeting_loopback_buffer.clear();
+                        self.meeting_mic_processed_samples = 0;
+                        self.meeting_loopback_processed_samples = 0;
 
                         // Play feedback
                         self.play_feedback(SoundEvent::RecordingStart);
@@ -889,7 +905,6 @@ impl Daemon {
 
             match daemon.stop().await {
                 Ok(meeting_id) => {
-                    self.update_meeting_state("idle", None);
                     tracing::info!("Meeting stopped: {}", meeting_id);
 
                     self.play_feedback(SoundEvent::RecordingStop);
@@ -909,8 +924,12 @@ impl Daemon {
                 }
             }
 
+            self.update_meeting_state("idle", None);
+
             self.meeting_mic_buffer.clear();
             self.meeting_loopback_buffer.clear();
+            self.meeting_mic_processed_samples = 0;
+            self.meeting_loopback_processed_samples = 0;
             self.meeting_event_rx = None;
         }
 
@@ -1359,7 +1378,10 @@ impl Daemon {
                             // Profile exists but has no post_process_command, use default
                             if self.post_processing_enabled {
                                 if let Some(ref anthropic_processor) = self.anthropic_processor {
-                                    tracing::info!("Post-processing via Anthropic: {:?}", processed_text);
+                                    tracing::info!(
+                                        "Post-processing via Anthropic: {:?}",
+                                        processed_text
+                                    );
                                     let result = anthropic_processor.process(&processed_text).await;
                                     tracing::info!("Post-processed: {:?}", result);
                                     result
@@ -1678,12 +1700,9 @@ impl Daemon {
         };
 
         // Start system tray icon
-        if let Some((handle, action_rx)) =
-            tray::spawn_tray(self.post_processing_enabled).await
-        {
+        if let Some((handle, action_rx)) = tray::spawn_tray(self.post_processing_enabled).await {
             // Set up watch channel for state updates (sync -> async bridge)
-            let (state_tx, mut state_rx) =
-                tokio::sync::watch::channel(tray::TrayState::Idle);
+            let (state_tx, mut state_rx) = tokio::sync::watch::channel(tray::TrayState::Idle);
             let tray_handle_clone = handle.clone_for_watcher();
             tokio::spawn(async move {
                 while state_rx.changed().await.is_ok() {
@@ -2596,10 +2615,15 @@ impl Daemon {
                         let chunk_samples = self.meeting_chunk_samples();
                         if self.meeting_mic_buffer.len() >= chunk_samples {
                             let mic_chunk: Vec<f32> = self.meeting_mic_buffer.drain(..chunk_samples).collect();
+                            let mic_start_ms = self.meeting_mic_processed_samples * 1000 / 16000;
+                            self.meeting_mic_processed_samples += mic_chunk.len() as u64;
 
                             // Also drain loopback buffer up to the same amount
                             let loopback_len = self.meeting_loopback_buffer.len().min(chunk_samples);
                             let loopback_chunk: Vec<f32> = self.meeting_loopback_buffer.drain(..loopback_len).collect();
+                            let loopback_start_ms =
+                                self.meeting_loopback_processed_samples * 1000 / 16000;
+                            self.meeting_loopback_processed_samples += loopback_chunk.len() as u64;
 
                             // Enhance mic audio with GTCRN if available (removes echo/noise)
                             #[cfg(feature = "onnx-common")]
@@ -2621,7 +2645,11 @@ impl Daemon {
                             if let Some(ref mut daemon) = self.meeting_daemon {
                                 // Process mic chunk
                                 let mut had_loopback = false;
-                                match daemon.process_chunk_with_source(mic_chunk, meeting::data::AudioSource::Microphone).await {
+                                match daemon.process_chunk_with_source_at(
+                                    mic_chunk,
+                                    meeting::data::AudioSource::Microphone,
+                                    mic_start_ms,
+                                ).await {
                                     Ok(Some(segments)) => {
                                         tracing::debug!("Processed mic chunk with {} segments", segments.len());
                                     }
@@ -2633,7 +2661,11 @@ impl Daemon {
 
                                 // Process loopback chunk if non-empty
                                 if !loopback_chunk.is_empty() {
-                                    match daemon.process_chunk_with_source(loopback_chunk, meeting::data::AudioSource::Loopback).await {
+                                    match daemon.process_chunk_with_source_at(
+                                        loopback_chunk,
+                                        meeting::data::AudioSource::Loopback,
+                                        loopback_start_ms,
+                                    ).await {
                                         Ok(Some(segments)) => {
                                             tracing::debug!("Processed loopback chunk with {} segments", segments.len());
                                             if !segments.is_empty() {
@@ -2649,10 +2681,14 @@ impl Daemon {
 
                                 // Dedup bleed-through: strip echoed phrases from mic segments
                                 if had_loopback {
+                                    let mut removed = 0;
                                     if let Some(ref mut meeting) = daemon.current_meeting_mut() {
-                                        let removed = meeting.transcript.dedup_bleed_through();
-                                        if removed > 0 {
-                                            tracing::info!("Removed {} bleed-through word(s) via dedup", removed);
+                                        removed = meeting.transcript.dedup_bleed_through();
+                                    }
+                                    if removed > 0 {
+                                        tracing::info!("Removed {} bleed-through word(s) via dedup", removed);
+                                        if let Err(e) = daemon.persist_current_meeting() {
+                                            tracing::error!("Failed to persist transcript after dedup: {}", e);
                                         }
                                     }
                                 }

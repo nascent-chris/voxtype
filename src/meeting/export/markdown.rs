@@ -16,6 +16,7 @@ impl Exporter for MarkdownExporter {
         meeting: &MeetingData,
         options: &ExportOptions,
     ) -> Result<String, ExportError> {
+        let segments = meeting.transcript.aggregated_segments();
         let mut output = String::new();
 
         // Title
@@ -42,10 +43,7 @@ impl Exporter for MarkdownExporter {
                 "- **Word Count:** {}\n",
                 meeting.transcript.word_count()
             ));
-            output.push_str(&format!(
-                "- **Segments:** {}\n",
-                meeting.transcript.segments.len()
-            ));
+            output.push_str(&format!("- **Segments:** {}\n", segments.len()));
 
             let speakers = meeting.transcript.speakers();
             if !speakers.is_empty() {
@@ -100,7 +98,7 @@ impl Exporter for MarkdownExporter {
 
         let mut last_speaker = String::new();
 
-        for segment in &meeting.transcript.segments {
+        for segment in &segments {
             if options.include_speakers {
                 let speaker = segment.speaker_display();
                 if speaker != last_speaker {

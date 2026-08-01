@@ -153,8 +153,9 @@ fn parse_speaker_id(s: &str) -> SpeakerId {
 
 impl Diarizer for SubprocessDiarizer {
     fn diarize(
-        &self,
+        &mut self,
         _samples: &[f32],
+        _chunk_start_ms: u64,
         _source: AudioSource,
         transcript_segments: &[TranscriptSegment],
     ) -> Vec<DiarizedSegment> {
@@ -182,6 +183,13 @@ impl Diarizer for SubprocessDiarizer {
 
     fn name(&self) -> &'static str {
         "subprocess"
+    }
+
+    fn reset(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 

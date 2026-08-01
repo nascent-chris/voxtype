@@ -16,6 +16,7 @@ impl Exporter for TextExporter {
         meeting: &MeetingData,
         options: &ExportOptions,
     ) -> Result<String, ExportError> {
+        let segments = meeting.transcript.aggregated_segments();
         let mut output = String::new();
 
         // Metadata header
@@ -40,7 +41,7 @@ impl Exporter for TextExporter {
         // Transcript
         let mut last_speaker = String::new();
 
-        for segment in &meeting.transcript.segments {
+        for segment in &segments {
             let mut line = String::new();
 
             // Timestamp
@@ -108,7 +109,7 @@ fn wrap_text(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meeting::data::{MeetingMetadata, Transcript, TranscriptSegment};
+    use crate::meeting::data::{AudioSource, TranscriptSegment};
 
     fn create_test_meeting() -> MeetingData {
         let mut meeting = MeetingData::new(Some("Test Meeting".to_string()));
@@ -166,6 +167,31 @@ mod tests {
         let output = exporter.export(&meeting, &options).unwrap();
         assert!(output.contains("Test Meeting"));
         assert!(output.contains("Date:"));
+    }
+
+    #[test]
+    fn test_text_export_aggregates_existing_raw_transcript() {
+        let mut meeting = MeetingData::new(Some("Aggregated".to_string()));
+
+        let mut first = TranscriptSegment::new(0, 0, 1_000, "Hello".to_string(), 0);
+        first.source = AudioSource::Loopback;
+        first.speaker_id = Some("SPEAKER_00".to_string());
+
+        let mut second = TranscriptSegment::new(1, 1_200, 2_000, "world".to_string(), 0);
+        second.source = AudioSource::Loopback;
+        second.speaker_id = Some("SPEAKER_00".to_string());
+
+        meeting.transcript.segments = vec![first, second];
+
+        let exporter = TextExporter;
+        let options = ExportOptions {
+            include_speakers: true,
+            ..Default::default()
+        };
+
+        let output = exporter.export(&meeting, &options).unwrap();
+        assert_eq!(output.matches("SPEAKER_00:").count(), 1);
+        assert!(output.contains("Hello world"));
     }
 
     #[test]

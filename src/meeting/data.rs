@@ -57,7 +57,6 @@ pub enum AudioSource {
     Unknown,
 }
 
-
 impl std::fmt::Display for AudioSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -140,6 +139,11 @@ impl TranscriptSegment {
     }
 }
 
+const TURN_MERGE_GAP_MS: u64 = 1_500;
+const SHORT_FRAGMENT_MERGE_GAP_MS: u64 = 2_500;
+const SHORT_FRAGMENT_WORDS: usize = 4;
+const SHORT_FRAGMENT_DURATION_MS: u64 = 1_500;
+
 /// Complete transcript for a meeting
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Transcript {
@@ -157,7 +161,32 @@ impl Transcript {
 
     /// Add a segment to the transcript
     pub fn add_segment(&mut self, segment: TranscriptSegment) {
-        self.segments.push(segment);
+        self.add_segments(std::iter::once(segment));
+    }
+
+    /// Add multiple segments and compact adjacent turns.
+    pub fn add_segments<I>(&mut self, segments: I)
+    where
+        I: IntoIterator<Item = TranscriptSegment>,
+    {
+        self.segments.extend(segments);
+        self.segments
+            .sort_by_key(|s| (s.start_ms, s.end_ms, s.chunk_id, s.id));
+        compact_segments(&mut self.segments);
+    }
+
+    /// Return an aggregated speaker-turn view of the transcript.
+    pub fn aggregated_segments(&self) -> Vec<TranscriptSegment> {
+        let mut segments = self.segments.clone();
+        compact_segments(&mut segments);
+        segments
+    }
+
+    /// Re-run transcript compaction after in-place segment edits.
+    pub fn recompact(&mut self) {
+        self.segments
+            .sort_by_key(|s| (s.start_ms, s.end_ms, s.chunk_id, s.id));
+        compact_segments(&mut self.segments);
     }
 
     /// Remove echoed phrases from mic segments that match loopback transcripts.
@@ -287,9 +316,9 @@ impl Transcript {
 
     /// Get the full text without speaker labels
     pub fn plain_text(&self) -> String {
-        self.segments
-            .iter()
-            .map(|s| s.text.as_str())
+        self.aggregated_segments()
+            .into_iter()
+            .map(|s| s.text)
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -299,7 +328,7 @@ impl Transcript {
         let mut result = String::new();
         let mut last_speaker = String::new();
 
-        for segment in &self.segments {
+        for segment in self.aggregated_segments() {
             let speaker = segment.speaker_display();
             if speaker != last_speaker {
                 if !result.is_empty() {
@@ -345,6 +374,144 @@ impl Transcript {
     }
 }
 
+fn compact_segments(segments: &mut Vec<TranscriptSegment>) {
+    if segments.len() < 2 {
+        return;
+    }
+
+    let mut compacted = Vec::with_capacity(segments.len());
+
+    for segment in segments.drain(..) {
+        if let Some(previous) = compacted.last_mut() {
+            if should_merge_segments(previous, &segment) {
+                merge_segment(previous, segment);
+                continue;
+            }
+        }
+        compacted.push(segment);
+    }
+
+    *segments = compacted;
+}
+
+fn should_merge_segments(previous: &TranscriptSegment, current: &TranscriptSegment) -> bool {
+    if previous.source != current.source {
+        return false;
+    }
+
+    let Some(previous_key) = merge_key(previous) else {
+        return false;
+    };
+    let Some(current_key) = merge_key(current) else {
+        return false;
+    };
+
+    if previous_key != current_key {
+        return false;
+    }
+
+    let gap_ms = current.start_ms.saturating_sub(previous.end_ms);
+    let max_gap_ms = if is_short_fragment(previous) || is_short_fragment(current) {
+        SHORT_FRAGMENT_MERGE_GAP_MS
+    } else {
+        TURN_MERGE_GAP_MS
+    };
+
+    gap_ms <= max_gap_ms
+}
+
+fn merge_key(segment: &TranscriptSegment) -> Option<String> {
+    if let Some(label) = segment
+        .speaker_label
+        .as_ref()
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+    {
+        return Some(format!("label:{label}"));
+    }
+
+    if let Some(id) = segment
+        .speaker_id
+        .as_ref()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+    {
+        return Some(format!("id:{id}"));
+    }
+
+    match segment.source {
+        AudioSource::Microphone => Some("source:microphone".to_string()),
+        AudioSource::Loopback => Some("source:loopback".to_string()),
+        AudioSource::Unknown => None,
+    }
+}
+
+fn is_short_fragment(segment: &TranscriptSegment) -> bool {
+    segment.duration_ms() <= SHORT_FRAGMENT_DURATION_MS
+        || segment.text.split_whitespace().count() <= SHORT_FRAGMENT_WORDS
+}
+
+fn merge_segment(previous: &mut TranscriptSegment, current: TranscriptSegment) {
+    let previous_duration_ms = previous.duration_ms();
+    let current_duration_ms = current.duration_ms();
+
+    previous.id = previous.id.min(current.id);
+    previous.start_ms = previous.start_ms.min(current.start_ms);
+    previous.end_ms = previous.end_ms.max(current.end_ms);
+    previous.chunk_id = previous.chunk_id.min(current.chunk_id);
+
+    if previous.speaker_label.is_none() {
+        previous.speaker_label = current.speaker_label.clone();
+    }
+    if previous.speaker_id.is_none() {
+        previous.speaker_id = current.speaker_id.clone();
+    }
+
+    previous.confidence = merge_confidence(
+        previous.confidence,
+        previous_duration_ms,
+        current.confidence,
+        current_duration_ms,
+    );
+    append_text(&mut previous.text, &current.text);
+}
+
+fn merge_confidence(
+    left: Option<f32>,
+    left_duration_ms: u64,
+    right: Option<f32>,
+    right_duration_ms: u64,
+) -> Option<f32> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let left_weight = left_duration_ms.max(1) as f32;
+            let right_weight = right_duration_ms.max(1) as f32;
+            Some((left * left_weight + right * right_weight) / (left_weight + right_weight))
+        }
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn append_text(base: &mut String, extra: &str) {
+    let extra = extra.trim();
+    if extra.is_empty() {
+        return;
+    }
+
+    if base.trim().is_empty() {
+        *base = extra.to_string();
+        return;
+    }
+
+    let ends_with_whitespace = base.chars().last().is_some_and(char::is_whitespace);
+    if !ends_with_whitespace && !base.ends_with('-') {
+        base.push(' ');
+    }
+    base.push_str(extra);
+}
+
 /// Meeting status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -360,7 +527,6 @@ pub enum MeetingStatus {
     /// Meeting was cancelled/abandoned
     Cancelled,
 }
-
 
 /// Metadata for a meeting
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -772,6 +938,30 @@ mod tests {
     }
 
     #[test]
+    fn test_transcript_recompact_merges_after_speaker_update() {
+        let mut transcript = Transcript::new();
+
+        let mut first = TranscriptSegment::new(1, 0, 1000, "hello".to_string(), 0);
+        first.source = AudioSource::Loopback;
+        first.speaker_id = Some("SPEAKER_00".to_string());
+        transcript.add_segment(first);
+
+        let mut second = TranscriptSegment::new(2, 1100, 2000, "world".to_string(), 1);
+        second.source = AudioSource::Loopback;
+        second.speaker_id = Some("SPEAKER_01".to_string());
+        transcript.add_segment(second);
+
+        assert_eq!(transcript.segments.len(), 2);
+
+        transcript.segments[1].speaker_id = Some("SPEAKER_00".to_string());
+        transcript.recompact();
+
+        assert_eq!(transcript.segments.len(), 1);
+        assert_eq!(transcript.segments[0].speaker_id.as_deref(), Some("SPEAKER_00"));
+        assert_eq!(transcript.segments[0].text, "hello world");
+    }
+
+    #[test]
     fn test_segment_duration_zero() {
         let segment = TranscriptSegment::new(0, 5000, 5000, "".to_string(), 0);
         assert_eq!(segment.duration_ms(), 0);
@@ -875,5 +1065,106 @@ mod tests {
         transcript.add_segment(TranscriptSegment::new(0, 0, 5000, "A".to_string(), 0));
         transcript.add_segment(TranscriptSegment::new(1, 5000, 12000, "B".to_string(), 1));
         assert_eq!(transcript.duration_ms(), 12000);
+    }
+
+    #[test]
+    fn test_transcript_add_segment_keeps_chronological_order() {
+        let mut transcript = Transcript::new();
+        transcript.add_segment(TranscriptSegment::new(
+            2,
+            5_000,
+            6_000,
+            "second".to_string(),
+            1,
+        ));
+        transcript.add_segment(TranscriptSegment::new(
+            1,
+            1_000,
+            2_000,
+            "first".to_string(),
+            0,
+        ));
+        transcript.add_segment(TranscriptSegment::new(
+            3,
+            5_000,
+            5_500,
+            "between".to_string(),
+            1,
+        ));
+
+        let texts: Vec<&str> = transcript
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["first", "between", "second"]);
+    }
+
+    #[test]
+    fn test_transcript_add_segment_merges_same_speaker_turns() {
+        let mut transcript = Transcript::new();
+
+        let mut first = TranscriptSegment::new(1, 0, 1_000, "Hello".to_string(), 0);
+        first.source = AudioSource::Microphone;
+        let mut second = TranscriptSegment::new(2, 1_250, 2_100, "world".to_string(), 0);
+        second.source = AudioSource::Microphone;
+
+        transcript.add_segment(first);
+        transcript.add_segment(second);
+
+        assert_eq!(transcript.segments.len(), 1);
+        assert_eq!(transcript.segments[0].text, "Hello world");
+        assert_eq!(transcript.segments[0].start_ms, 0);
+        assert_eq!(transcript.segments[0].end_ms, 2_100);
+    }
+
+    #[test]
+    fn test_transcript_add_segment_does_not_merge_unknown_source() {
+        let mut transcript = Transcript::new();
+        transcript.add_segment(TranscriptSegment::new(1, 0, 1_000, "first".to_string(), 0));
+        transcript.add_segment(TranscriptSegment::new(
+            2,
+            1_100,
+            2_000,
+            "second".to_string(),
+            0,
+        ));
+
+        assert_eq!(transcript.segments.len(), 2);
+    }
+
+    #[test]
+    fn test_transcript_add_segment_does_not_merge_different_speakers() {
+        let mut transcript = Transcript::new();
+
+        let mut first = TranscriptSegment::new(1, 0, 1_000, "Hello".to_string(), 0);
+        first.source = AudioSource::Loopback;
+        first.speaker_id = Some("SPEAKER_00".to_string());
+
+        let mut second = TranscriptSegment::new(2, 1_100, 2_000, "Hi".to_string(), 0);
+        second.source = AudioSource::Loopback;
+        second.speaker_id = Some("SPEAKER_01".to_string());
+
+        transcript.add_segment(first);
+        transcript.add_segment(second);
+
+        assert_eq!(transcript.segments.len(), 2);
+    }
+
+    #[test]
+    fn test_aggregated_segments_compact_existing_raw_transcript() {
+        let mut first = TranscriptSegment::new(1, 0, 1_000, "Hello".to_string(), 0);
+        first.source = AudioSource::Microphone;
+        let mut second = TranscriptSegment::new(2, 1_250, 2_100, "world".to_string(), 0);
+        second.source = AudioSource::Microphone;
+
+        let transcript = Transcript {
+            segments: vec![first, second],
+            total_chunks: 1,
+        };
+
+        let aggregated = transcript.aggregated_segments();
+        assert_eq!(aggregated.len(), 1);
+        assert_eq!(aggregated[0].text, "Hello world");
     }
 }

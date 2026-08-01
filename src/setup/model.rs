@@ -125,6 +125,36 @@ const PARAKEET_MODELS: &[ParakeetModelInfo] = &[
 ];
 
 // =============================================================================
+// Speaker Embedding Model Definitions
+// =============================================================================
+
+/// Speaker embedding model information for local meeting diarization.
+struct SpeakerEmbeddingModelInfo {
+    name: &'static str,
+    dir_name: &'static str,
+    file_name: &'static str,
+    size_mb: u32,
+    huggingface_repo: &'static str,
+}
+
+const SPEAKER_EMBEDDING_MODELS: &[SpeakerEmbeddingModelInfo] = &[
+    SpeakerEmbeddingModelInfo {
+        name: "wespeaker-resnet221-lm",
+        dir_name: "wespeaker-resnet221-lm",
+        file_name: "voxceleb_resnet221_LM.onnx",
+        size_mb: 95,
+        huggingface_repo: "Wespeaker/wespeaker-voxceleb-resnet221-LM",
+    },
+    SpeakerEmbeddingModelInfo {
+        name: "wespeaker-resnet34",
+        dir_name: "wespeaker-resnet34",
+        file_name: "voxceleb_resnet34.onnx",
+        size_mb: 26,
+        huggingface_repo: "Wespeaker/wespeaker-voxceleb-resnet34",
+    },
+];
+
+// =============================================================================
 // Moonshine Model Definitions
 // =============================================================================
 
@@ -320,10 +350,7 @@ const SENSEVOICE_MODELS: &[SenseVoiceModelInfo] = &[
         size_mb: 938,
         description: "Full precision (larger, slightly better accuracy)",
         languages: "zh/en/ja/ko/yue",
-        files: &[
-            ("model.onnx", "model.onnx"),
-            ("tokens.txt", "tokens.txt"),
-        ],
+        files: &[("model.onnx", "model.onnx"), ("tokens.txt", "tokens.txt")],
         huggingface_repo: "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
     },
 ];
@@ -384,20 +411,18 @@ struct DolphinModelInfo {
     huggingface_repo: &'static str,
 }
 
-const DOLPHIN_MODELS: &[DolphinModelInfo] = &[
-    DolphinModelInfo {
-        name: "base",
-        dir_name: "dolphin-base",
-        size_mb: 198,
-        description: "Dictation-optimized (recommended)",
-        languages: "en/zh",
-        files: &[
-            ("model.int8.onnx", "model.int8.onnx"),
-            ("tokens.txt", "tokens.txt"),
-        ],
-        huggingface_repo: "csukuangfj/sherpa-onnx-dolphin-base-ctc-multi-lang-int8-2025-04-02",
-    },
-];
+const DOLPHIN_MODELS: &[DolphinModelInfo] = &[DolphinModelInfo {
+    name: "base",
+    dir_name: "dolphin-base",
+    size_mb: 198,
+    description: "Dictation-optimized (recommended)",
+    languages: "en/zh",
+    files: &[
+        ("model.int8.onnx", "model.int8.onnx"),
+        ("tokens.txt", "tokens.txt"),
+    ],
+    huggingface_repo: "csukuangfj/sherpa-onnx-dolphin-base-ctc-multi-lang-int8-2025-04-02",
+}];
 
 // =============================================================================
 // Omnilingual Model Definitions
@@ -413,20 +438,15 @@ struct OmnilingualModelInfo {
     huggingface_repo: &'static str,
 }
 
-const OMNILINGUAL_MODELS: &[OmnilingualModelInfo] = &[
-    OmnilingualModelInfo {
-        name: "300m",
-        dir_name: "omnilingual-300m",
-        size_mb: 3900,
-        description: "1600+ languages, 300M params",
-        languages: "1600+ langs",
-        files: &[
-            ("model.onnx", "model.onnx"),
-            ("tokens.txt", "tokens.txt"),
-        ],
-        huggingface_repo: "csukuangfj/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-2025-11-12",
-    },
-];
+const OMNILINGUAL_MODELS: &[OmnilingualModelInfo] = &[OmnilingualModelInfo {
+    name: "300m",
+    dir_name: "omnilingual-300m",
+    size_mb: 3900,
+    description: "1600+ languages, 300M params",
+    languages: "1600+ langs",
+    files: &[("model.onnx", "model.onnx"), ("tokens.txt", "tokens.txt")],
+    huggingface_repo: "csukuangfj/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-2025-11-12",
+}];
 
 // =============================================================================
 // Whisper Model Functions
@@ -437,9 +457,35 @@ pub fn is_valid_model(name: &str) -> bool {
     MODELS.iter().any(|m| m.name == name)
 }
 
+/// Check if a model name is accepted by non-interactive `voxtype setup --model`.
+pub fn is_setup_model_name(name: &str) -> bool {
+    is_valid_model(name)
+        || is_parakeet_model(name)
+        || is_sensevoice_model(name)
+        || is_speaker_embedding_model(name)
+}
+
+/// Check if a model name is recognized anywhere in the setup/model system.
+pub fn is_recognized_model_name(name: &str) -> bool {
+    is_setup_model_name(name)
+        || MOONSHINE_MODELS.iter().any(|m| m.name == name)
+        || PARAFORMER_MODELS.iter().any(|m| m.name == name)
+        || DOLPHIN_MODELS.iter().any(|m| m.name == name)
+        || OMNILINGUAL_MODELS.iter().any(|m| m.name == name)
+}
+
 /// Get list of valid model names (for error messages)
 pub fn valid_model_names() -> Vec<&'static str> {
     MODELS.iter().map(|m| m.name).collect()
+}
+
+/// Get list of valid model names for non-interactive `voxtype setup --model`.
+pub fn valid_setup_model_names() -> Vec<&'static str> {
+    let mut names = valid_model_names();
+    names.extend(valid_parakeet_model_names());
+    names.extend(valid_sensevoice_model_names());
+    names.extend(valid_speaker_embedding_model_names());
+    names
 }
 
 /// Run interactive model selection (single menu with all models)
@@ -635,8 +681,8 @@ pub async fn interactive_select() -> anyhow::Result<()> {
     }
 
     // --- Paraformer Section ---
-    let paraformer_offset = sensevoice_offset
-        + available_count(sensevoice_available, sensevoice_count);
+    let paraformer_offset =
+        sensevoice_offset + available_count(sensevoice_available, sensevoice_count);
     println!("\n--- Paraformer (FunASR, Chinese + English) ---\n");
 
     if paraformer_available {
@@ -669,8 +715,8 @@ pub async fn interactive_select() -> anyhow::Result<()> {
     }
 
     // --- Dolphin Section ---
-    let dolphin_offset = paraformer_offset
-        + available_count(paraformer_available, paraformer_count);
+    let dolphin_offset =
+        paraformer_offset + available_count(paraformer_available, paraformer_count);
     println!("\n--- Dolphin (dictation-optimized CTC) ---\n");
 
     if dolphin_available {
@@ -703,8 +749,7 @@ pub async fn interactive_select() -> anyhow::Result<()> {
     }
 
     // --- Omnilingual Section ---
-    let omnilingual_offset = dolphin_offset
-        + available_count(dolphin_available, dolphin_count);
+    let omnilingual_offset = dolphin_offset + available_count(dolphin_available, dolphin_count);
     println!("\n--- Omnilingual (FunASR, 50+ languages) ---\n");
 
     if omnilingual_available {
@@ -766,13 +811,40 @@ pub async fn interactive_select() -> anyhow::Result<()> {
         handle_sensevoice_selection(sensevoice_index).await
     } else if paraformer_available && selection <= paraformer_offset + paraformer_count {
         let idx = selection - paraformer_offset;
-        handle_onnx_engine_selection("paraformer", PARAFORMER_MODELS.iter().map(|m| (m.name, m.dir_name, m.size_mb, m.files, m.huggingface_repo)).collect(), idx, validate_onnx_ctc_model).await
+        handle_onnx_engine_selection(
+            "paraformer",
+            PARAFORMER_MODELS
+                .iter()
+                .map(|m| (m.name, m.dir_name, m.size_mb, m.files, m.huggingface_repo))
+                .collect(),
+            idx,
+            validate_onnx_ctc_model,
+        )
+        .await
     } else if dolphin_available && selection <= dolphin_offset + dolphin_count {
         let idx = selection - dolphin_offset;
-        handle_onnx_engine_selection("dolphin", DOLPHIN_MODELS.iter().map(|m| (m.name, m.dir_name, m.size_mb, m.files, m.huggingface_repo)).collect(), idx, validate_onnx_ctc_model).await
+        handle_onnx_engine_selection(
+            "dolphin",
+            DOLPHIN_MODELS
+                .iter()
+                .map(|m| (m.name, m.dir_name, m.size_mb, m.files, m.huggingface_repo))
+                .collect(),
+            idx,
+            validate_onnx_ctc_model,
+        )
+        .await
     } else if omnilingual_available && selection <= omnilingual_offset + omnilingual_count {
         let idx = selection - omnilingual_offset;
-        handle_onnx_engine_selection("omnilingual", OMNILINGUAL_MODELS.iter().map(|m| (m.name, m.dir_name, m.size_mb, m.files, m.huggingface_repo)).collect(), idx, validate_onnx_ctc_model).await
+        handle_onnx_engine_selection(
+            "omnilingual",
+            OMNILINGUAL_MODELS
+                .iter()
+                .map(|m| (m.name, m.dir_name, m.size_mb, m.files, m.huggingface_repo))
+                .collect(),
+            idx,
+            validate_onnx_ctc_model,
+        )
+        .await
     } else {
         println!("\nInvalid selection.");
         Ok(())
@@ -1252,6 +1324,109 @@ pub fn is_parakeet_model(name: &str) -> bool {
 /// Get list of valid Parakeet model names
 pub fn valid_parakeet_model_names() -> Vec<&'static str> {
     PARAKEET_MODELS.iter().map(|m| m.name).collect()
+}
+
+/// Check if a model name is a local speaker embedding model.
+pub fn is_speaker_embedding_model(name: &str) -> bool {
+    SPEAKER_EMBEDDING_MODELS.iter().any(|m| m.name == name)
+}
+
+/// Get the directory name for a speaker embedding model.
+pub fn speaker_embedding_dir_name(name: &str) -> Option<&'static str> {
+    SPEAKER_EMBEDDING_MODELS
+        .iter()
+        .find(|m| m.name == name)
+        .map(|m| m.dir_name)
+}
+
+/// Get list of valid speaker embedding model names.
+pub fn valid_speaker_embedding_model_names() -> Vec<&'static str> {
+    SPEAKER_EMBEDDING_MODELS.iter().map(|m| m.name).collect()
+}
+
+/// Validate that a speaker embedding model directory has a known ONNX file.
+pub fn validate_speaker_embedding_model(path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        anyhow::bail!("Model directory does not exist: {:?}", path);
+    }
+
+    let has_model = SPEAKER_EMBEDDING_MODELS
+        .iter()
+        .any(|model| path.join(model.file_name).exists());
+
+    if has_model {
+        Ok(())
+    } else {
+        anyhow::bail!("Incomplete speaker embedding model, missing ONNX file")
+    }
+}
+
+/// Download a speaker embedding model by name.
+pub fn download_speaker_embedding_model(model_name: &str) -> anyhow::Result<()> {
+    let model = SPEAKER_EMBEDDING_MODELS
+        .iter()
+        .find(|m| m.name == model_name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown speaker embedding model: {}", model_name))?;
+
+    download_speaker_embedding_model_by_info(model)
+}
+
+fn download_speaker_embedding_model_by_info(
+    model: &SpeakerEmbeddingModelInfo,
+) -> anyhow::Result<()> {
+    let models_dir = Config::models_dir();
+    let model_path = models_dir.join(model.dir_name);
+    let file_path = model_path.join(model.file_name);
+
+    std::fs::create_dir_all(&model_path)?;
+
+    println!("\nDownloading {} ({} MB)...\n", model.name, model.size_mb);
+
+    if !file_path.exists() {
+        let url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            model.huggingface_repo, model.file_name
+        );
+
+        println!("Downloading {}...", model.file_name);
+
+        let status = Command::new("curl")
+            .args([
+                "-L",
+                "--progress-bar",
+                "-o",
+                file_path.to_str().unwrap_or("model.onnx"),
+                &url,
+            ])
+            .status();
+
+        match status {
+            Ok(exit_status) if exit_status.success() => {}
+            Ok(exit_status) => {
+                print_failure(&format!(
+                    "Download failed: curl exited with code {}",
+                    exit_status.code().unwrap_or(-1)
+                ));
+                let _ = std::fs::remove_file(&file_path);
+                anyhow::bail!("Download failed for {}", model.file_name)
+            }
+            Err(e) => {
+                print_failure(&format!("Failed to run curl: {}", e));
+                print_info("Please ensure curl is installed (e.g., 'sudo pacman -S curl')");
+                anyhow::bail!("curl not available: {}", e)
+            }
+        }
+    } else {
+        println!("  {} already exists, skipping", model.file_name);
+    }
+
+    validate_speaker_embedding_model(&model_path)?;
+    print_success(&format!(
+        "Model '{}' downloaded to {:?}",
+        model.name, model_path
+    ));
+
+    Ok(())
 }
 
 /// Validate that a Parakeet model directory has the required files
@@ -1862,8 +2037,7 @@ pub fn validate_sensevoice_model(path: &Path) -> anyhow::Result<()> {
         anyhow::bail!("Model directory does not exist: {:?}", path);
     }
 
-    let has_model =
-        path.join("model.int8.onnx").exists() || path.join("model.onnx").exists();
+    let has_model = path.join("model.int8.onnx").exists() || path.join("model.onnx").exists();
     let has_tokens = path.join("tokens.txt").exists();
 
     if has_model && has_tokens {
@@ -2179,7 +2353,10 @@ async fn handle_onnx_engine_selection(
 
     // Validate
     validate_fn(&model_path)?;
-    print_success(&format!("Model '{}' downloaded to {:?}", dir_name, model_path));
+    print_success(&format!(
+        "Model '{}' downloaded to {:?}",
+        dir_name, model_path
+    ));
 
     // Update config and restart daemon
     update_config_engine(engine_name, name)?;
@@ -2210,10 +2387,7 @@ fn download_onnx_model(
             continue;
         }
 
-        let url = format!(
-            "https://huggingface.co/{}/resolve/main/{}",
-            repo, repo_path
-        );
+        let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, repo_path);
 
         println!("Downloading {}...", local_filename);
 
@@ -2328,7 +2502,10 @@ fn update_engine_in_config(config: &str, engine_name: &str, model_name: &str) ->
     }
 
     if !has_section {
-        result.push_str(&format!("\n[{}]\nmodel = \"{}\"\n", engine_name, model_name));
+        result.push_str(&format!(
+            "\n[{}]\nmodel = \"{}\"\n",
+            engine_name, model_name
+        ));
     }
 
     if !config.ends_with('\n') && result.ends_with('\n') {
@@ -2485,6 +2662,33 @@ language = "en"
         assert!(names.contains(&"tiny.en"));
         assert!(names.contains(&"large-v3-turbo"));
         assert_eq!(names.len(), MODELS.len());
+    }
+
+    #[test]
+    fn test_is_setup_model_name() {
+        assert!(is_setup_model_name("large-v3"));
+        assert!(is_setup_model_name("parakeet-tdt-0.6b-v3"));
+        assert!(is_setup_model_name("small"));
+        assert!(is_setup_model_name("wespeaker-resnet221-lm"));
+        assert!(!is_setup_model_name("moonshine-not-supported-here"));
+    }
+
+    #[test]
+    fn test_is_recognized_model_name() {
+        assert!(is_recognized_model_name("large-v3"));
+        assert!(is_recognized_model_name("parakeet-tdt-0.6b-v3"));
+        assert!(is_recognized_model_name("base"));
+        assert!(is_recognized_model_name("wespeaker-resnet34"));
+        assert!(!is_recognized_model_name("not-a-real-model"));
+    }
+
+    #[test]
+    fn test_valid_setup_model_names_includes_speaker_embeddings() {
+        let names = valid_setup_model_names();
+        assert!(names.contains(&"large-v3-turbo"));
+        assert!(names.contains(&"parakeet-tdt-0.6b-v3"));
+        assert!(names.contains(&"small"));
+        assert!(names.contains(&"wespeaker-resnet221-lm"));
     }
 
     // =========================================================================
@@ -2817,6 +3021,31 @@ translate = false
         assert!(names.contains(&"base"));
         assert!(names.contains(&"tiny"));
         assert_eq!(names.len(), MOONSHINE_MODELS.len());
+    }
+
+    #[test]
+    fn test_is_speaker_embedding_model() {
+        assert!(is_speaker_embedding_model("wespeaker-resnet221-lm"));
+        assert!(is_speaker_embedding_model("wespeaker-resnet34"));
+        assert!(!is_speaker_embedding_model("base.en"));
+        assert!(!is_speaker_embedding_model(""));
+    }
+
+    #[test]
+    fn test_valid_speaker_embedding_model_names() {
+        let names = valid_speaker_embedding_model_names();
+        assert!(names.contains(&"wespeaker-resnet221-lm"));
+        assert!(names.contains(&"wespeaker-resnet34"));
+        assert_eq!(names.len(), SPEAKER_EMBEDDING_MODELS.len());
+    }
+
+    #[test]
+    fn test_speaker_embedding_dir_name() {
+        assert_eq!(
+            speaker_embedding_dir_name("wespeaker-resnet221-lm"),
+            Some("wespeaker-resnet221-lm")
+        );
+        assert_eq!(speaker_embedding_dir_name("missing"), None);
     }
 
     #[test]

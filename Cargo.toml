@@ -100,6 +100,10 @@ gpu-metal = ["whisper-rs/metal"]
 gpu-hipblas = ["whisper-rs/hipblas"]
 # ML-based speaker diarization (uses ONNX for embedding extraction)
 ml-diarization = ["dep:ort", "dep:ndarray"]
+ml-diarization-cuda = ["ml-diarization", "ort/cuda"]
+# Local speaker-embedding diarization (WeSpeaker-style ONNX embeddings)
+speaker-embedding = ["dep:ort", "dep:ndarray", "dep:rustfft"]
+speaker-embedding-cuda = ["speaker-embedding", "ort/cuda"]
 # Parakeet backend (ONNX-based, alternative to Whisper)
 parakeet = ["dep:parakeet-rs"]
 parakeet-cuda = ["parakeet", "parakeet-rs/cuda"]

@@ -40,6 +40,7 @@ pub use state::{ChunkState, MeetingState};
 pub use storage::{MeetingStorage, StorageConfig, StorageError};
 
 use crate::error::{MeetingError, Result};
+use crate::meeting::diarization::Diarizer;
 use crate::transcribe::{self, Transcriber};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -57,6 +58,8 @@ pub struct MeetingConfig {
     pub retain_audio: bool,
     /// Maximum meeting duration in minutes (0 = unlimited)
     pub max_duration_mins: u32,
+    /// Speaker diarization configuration
+    pub diarization: diarization::DiarizationConfig,
 }
 
 impl Default for MeetingConfig {
@@ -67,6 +70,7 @@ impl Default for MeetingConfig {
             storage: StorageConfig::default(),
             retain_audio: false,
             max_duration_mins: 180,
+            diarization: diarization::DiarizationConfig::default(),
         }
     }
 }
@@ -98,7 +102,9 @@ pub struct MeetingDaemon {
     storage: MeetingStorage,
     current_meeting: Option<MeetingData>,
     transcriber: Option<Arc<dyn Transcriber>>,
+    diarizer: Box<dyn Diarizer>,
     engine_name: String,
+    next_segment_id: u32,
     event_tx: mpsc::Sender<MeetingEvent>,
 }
 
@@ -114,6 +120,7 @@ impl MeetingDaemon {
 
         let transcriber: Arc<dyn Transcriber> =
             Arc::from(transcribe::create_transcriber(app_config)?);
+        let diarizer = diarization::create_diarizer(&config.diarization);
         let engine_name = format!("{:?}", app_config.engine).to_lowercase();
 
         Ok(Self {
@@ -122,7 +129,9 @@ impl MeetingDaemon {
             storage,
             current_meeting: None,
             transcriber: Some(transcriber),
+            diarizer,
             engine_name,
+            next_segment_id: 0,
             event_tx,
         })
     }
@@ -132,6 +141,9 @@ impl MeetingDaemon {
         if !self.state.is_idle() {
             return Err(MeetingError::AlreadyInProgress.into());
         }
+
+        self.next_segment_id = 0;
+        self.diarizer.reset();
 
         // Create meeting
         let mut meeting = MeetingData::new(title);
@@ -190,40 +202,71 @@ impl MeetingDaemon {
         }
 
         self.state = std::mem::take(&mut self.state).stop();
-
-        // Finalize meeting
-        if let Some(ref mut meeting) = self.current_meeting {
-            meeting.complete();
-            meeting.metadata.chunk_count = meeting.transcript.total_chunks;
-
-            // Save transcript
-            self.storage
-                .save_transcript(&meeting.metadata.id, &meeting.transcript)
-                .map_err(|e| MeetingError::Storage(e.to_string()))?;
-
-            // Update metadata
-            self.storage
-                .update_meeting(&meeting.metadata)
-                .map_err(|e| MeetingError::Storage(e.to_string()))?;
-        }
-
         let meeting_id = self
             .current_meeting
             .as_ref()
             .map(|m| m.metadata.id)
             .unwrap_or_default();
 
-        let _ = self
-            .event_tx
-            .send(MeetingEvent::Stopped { meeting_id })
-            .await;
-        tracing::info!("Meeting stopped: {}", meeting_id);
+        let finalize_result = if let Some(ref mut meeting) = self.current_meeting {
+            meeting.complete();
+            meeting.metadata.chunk_count = meeting.transcript.total_chunks;
+
+            self.storage
+                .save_transcript(&meeting.metadata.id, &meeting.transcript)
+                .map_err(|e| MeetingError::Storage(e.to_string()))
+                .and_then(|_| {
+                    self.storage
+                        .update_meeting(&meeting.metadata)
+                        .map_err(|e| MeetingError::Storage(e.to_string()))
+                })
+        } else {
+            Ok(())
+        };
+
+        match &finalize_result {
+            Ok(()) => {
+                let _ = self
+                    .event_tx
+                    .send(MeetingEvent::Stopped { meeting_id })
+                    .await;
+                tracing::info!("Meeting stopped: {}", meeting_id);
+            }
+            Err(err) => {
+                let _ = self
+                    .event_tx
+                    .send(MeetingEvent::Error(format!(
+                        "Failed to finalize meeting {}: {}",
+                        meeting_id, err
+                    )))
+                    .await;
+            }
+        }
 
         // Clean up
         self.state = std::mem::take(&mut self.state).finalize();
         self.current_meeting = None;
+        self.next_segment_id = 0;
+        self.diarizer.reset();
 
+        finalize_result.map_err(crate::error::VoxtypeError::from)?;
         Ok(meeting_id)
+    }
+
+    /// Persist the current meeting transcript and metadata to storage.
+    pub fn persist_current_meeting(&self) -> Result<()> {
+        let Some(meeting) = self.current_meeting.as_ref() else {
+            return Ok(());
+        };
+
+        self.storage
+            .save_transcript(&meeting.metadata.id, &meeting.transcript)
+            .map_err(|e| MeetingError::Storage(e.to_string()))?;
+        self.storage
+            .update_meeting(&meeting.metadata)
+            .map_err(|e| MeetingError::Storage(e.to_string()))?;
+
+        Ok(())
     }
 
     /// Get current meeting state
@@ -246,7 +289,8 @@ impl MeetingDaemon {
         &mut self,
         samples: Vec<f32>,
     ) -> Result<Option<Vec<TranscriptSegment>>> {
-        self.process_chunk_with_source(samples, AudioSource::Microphone).await
+        self.process_chunk_with_source(samples, AudioSource::Microphone)
+            .await
     }
 
     /// Process a chunk of audio with a specific source label
@@ -254,6 +298,30 @@ impl MeetingDaemon {
         &mut self,
         samples: Vec<f32>,
         source: AudioSource,
+    ) -> Result<Option<Vec<TranscriptSegment>>> {
+        let chunk_duration_ms = samples.len() as u64 * 1000 / 16_000;
+        let start_offset_ms = self
+            .state
+            .elapsed()
+            .map(|duration| duration.as_millis() as u64)
+            .or_else(|| {
+                self.current_meeting
+                    .as_ref()
+                    .map(|meeting| meeting.transcript.duration_ms())
+            })
+            .unwrap_or(0)
+            .saturating_sub(chunk_duration_ms);
+
+        self.process_chunk_with_source_at(samples, source, start_offset_ms)
+            .await
+    }
+
+    /// Process a chunk of audio with an explicit wall-clock start offset.
+    pub async fn process_chunk_with_source_at(
+        &mut self,
+        samples: Vec<f32>,
+        source: AudioSource,
+        start_offset_ms: u64,
     ) -> Result<Option<Vec<TranscriptSegment>>> {
         if !self.state.is_active() {
             return Ok(None);
@@ -269,27 +337,94 @@ impl MeetingDaemon {
             ..Default::default()
         };
 
-        // Calculate start offset
-        let start_offset_ms = if let Some(ref meeting) = self.current_meeting {
-            meeting.transcript.duration_ms()
-        } else {
-            0
-        };
-
-        let mut processor = ChunkProcessor::new(chunk_config, transcriber.clone());
+        let mut processor = ChunkProcessor::new_with_segment_id(
+            chunk_config,
+            transcriber.clone(),
+            self.next_segment_id,
+        );
         let mut buffer = processor.new_buffer(chunk_id, source, start_offset_ms);
         buffer.add_samples(&samples);
 
         let result = processor
             .process_chunk(buffer)
             .map_err(crate::error::VoxtypeError::Transcribe)?;
+        self.next_segment_id = processor.next_segment_id();
+
+        let mut segments = result.segments;
+        if self.config.diarization.enabled && !segments.is_empty() {
+            let diarized =
+                self.diarizer
+                    .diarize(&result.samples, result.chunk_start_ms, source, &segments);
+
+            if !diarized.is_empty() {
+                let mut reusable_ids = segments.iter().map(|segment| segment.id);
+                let mut refined_segments = Vec::with_capacity(diarized.len());
+
+                for diarized_segment in diarized {
+                    let text = diarized_segment.text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+
+                    let segment_id = if let Some(existing) = reusable_ids.next() {
+                        existing
+                    } else {
+                        let new_id = self.next_segment_id;
+                        self.next_segment_id += 1;
+                        new_id
+                    };
+
+                    let mut segment = TranscriptSegment::new(
+                        segment_id,
+                        diarized_segment.start_ms,
+                        diarized_segment.end_ms,
+                        text.to_string(),
+                        chunk_id,
+                    );
+                    segment.source = source;
+                    segment.speaker_id = Some(diarized_segment.speaker.display_name());
+                    segment.confidence = Some(diarized_segment.confidence);
+                    refined_segments.push(segment);
+                }
+
+                if !refined_segments.is_empty() {
+                    segments = refined_segments;
+                } else {
+                    tracing::warn!(
+                        "Diarizer '{}' returned only empty refined segments for chunk {}",
+                        self.diarizer.name(),
+                        chunk_id
+                    );
+                }
+            }
+        }
 
         // Add segments to transcript
         if let Some(ref mut meeting) = self.current_meeting {
-            for segment in &result.segments {
-                meeting.transcript.add_segment(segment.clone());
+            if !self.config.diarization.enabled && matches!(source, AudioSource::Loopback) {
+                meeting.transcript.segments.extend(segments.iter().cloned());
+                meeting
+                    .transcript
+                    .segments
+                    .sort_by_key(|segment| (segment.start_ms, segment.end_ms, segment.chunk_id, segment.id));
+            } else {
+                meeting.transcript.add_segments(segments.iter().cloned());
             }
             meeting.transcript.total_chunks = chunk_id + 1;
+            meeting.metadata.chunk_count = meeting.transcript.total_chunks;
+        }
+
+        if !segments.is_empty() {
+            if let Err(err) = self.persist_current_meeting() {
+                tracing::error!("Failed to persist active meeting state: {}", err);
+                let _ = self
+                    .event_tx
+                    .send(MeetingEvent::Error(format!(
+                        "Failed to persist active meeting transcript: {}",
+                        err
+                    )))
+                    .await;
+            }
         }
 
         // Advance state
@@ -300,11 +435,11 @@ impl MeetingDaemon {
             .event_tx
             .send(MeetingEvent::ChunkProcessed {
                 chunk_id,
-                segments: result.segments.clone(),
+                segments: segments.clone(),
             })
             .await;
 
-        Ok(Some(result.segments))
+        Ok(Some(segments))
     }
 
     /// Get storage access
@@ -347,6 +482,118 @@ pub fn export_meeting_by_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::TranscribeError;
+    use crate::meeting::diarization::{DiarizedSegment, SpeakerId};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    struct MockTranscriber {
+        text: String,
+        calls: Mutex<Vec<usize>>,
+    }
+
+    impl MockTranscriber {
+        fn new(text: &str) -> Self {
+            Self {
+                text: text.to_string(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Transcriber for MockTranscriber {
+        fn transcribe(&self, samples: &[f32]) -> std::result::Result<String, TranscribeError> {
+            self.calls.lock().unwrap().push(samples.len());
+            Ok(self.text.clone())
+        }
+    }
+
+    struct ResetTrackingDiarizer {
+        reset_calls: Arc<AtomicUsize>,
+    }
+
+    impl ResetTrackingDiarizer {
+        fn new(reset_calls: Arc<AtomicUsize>) -> Self {
+            Self { reset_calls }
+        }
+    }
+
+    impl Diarizer for ResetTrackingDiarizer {
+        fn diarize(
+            &mut self,
+            _samples: &[f32],
+            _chunk_start_ms: u64,
+            source: AudioSource,
+            transcript_segments: &[TranscriptSegment],
+        ) -> Vec<DiarizedSegment> {
+            let speaker = match source {
+                AudioSource::Microphone => SpeakerId::You,
+                AudioSource::Loopback => SpeakerId::Remote,
+                AudioSource::Unknown => SpeakerId::Unknown,
+            };
+
+            transcript_segments
+                .iter()
+                .map(|segment| DiarizedSegment {
+                    speaker: speaker.clone(),
+                    start_ms: segment.start_ms,
+                    end_ms: segment.end_ms,
+                    text: segment.text.clone(),
+                    confidence: 1.0,
+                })
+                .collect()
+        }
+
+        fn name(&self) -> &'static str {
+            "reset-tracking"
+        }
+
+        fn reset(&mut self) {
+            self.reset_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn create_test_meeting_daemon(
+        diarization_enabled: bool,
+        diarizer: Box<dyn Diarizer>,
+    ) -> (MeetingDaemon, TempDir) {
+        let temp = TempDir::new().expect("tempdir");
+        let config = MeetingConfig {
+            enabled: true,
+            storage: StorageConfig {
+                storage_path: temp.path().to_path_buf(),
+                retain_audio: false,
+                max_meetings: 0,
+            },
+            diarization: diarization::DiarizationConfig {
+                enabled: diarization_enabled,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let storage = MeetingStorage::open(config.storage.clone()).expect("storage");
+        let (event_tx, _event_rx) = mpsc::channel(8);
+
+        (
+            MeetingDaemon {
+                config,
+                state: MeetingState::Idle,
+                storage,
+                current_meeting: None,
+                transcriber: Some(Arc::new(MockTranscriber::new("hello world"))),
+                diarizer,
+                engine_name: "test".to_string(),
+                next_segment_id: 0,
+                event_tx,
+            },
+            temp,
+        )
+    }
 
     #[test]
     fn test_meeting_config_default() {
@@ -375,5 +622,177 @@ mod tests {
 
         let state = state.finalize();
         assert!(state.is_idle());
+    }
+
+    #[tokio::test]
+    async fn test_process_chunk_persists_transcript_during_active_meeting() {
+        let (mut daemon, _temp) =
+            create_test_meeting_daemon(false, Box::new(diarization::simple::SimpleDiarizer::new()));
+        let meeting_id = daemon
+            .start(Some("Persistence Test".to_string()))
+            .await
+            .expect("meeting start");
+
+        let samples = vec![0.2; 16_000];
+        let result = daemon
+            .process_chunk_with_source_at(samples, AudioSource::Microphone, 0)
+            .await
+            .expect("process chunk");
+
+        assert!(result.is_some());
+
+        let persisted = daemon
+            .storage()
+            .load_transcript(&meeting_id)
+            .expect("persisted transcript");
+        assert_eq!(persisted.segments.len(), 1);
+        assert_eq!(persisted.segments[0].text, "hello world");
+
+        let metadata = daemon
+            .storage()
+            .get_meeting(&meeting_id)
+            .expect("metadata lookup")
+            .expect("meeting metadata");
+        assert_eq!(metadata.chunk_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_process_chunk_continues_when_incremental_persist_fails() {
+        let (mut daemon, _temp) =
+            create_test_meeting_daemon(false, Box::new(diarization::simple::SimpleDiarizer::new()));
+        let meeting_id = daemon
+            .start(Some("Persistence Failure".to_string()))
+            .await
+            .expect("meeting start");
+
+        let storage_path = daemon
+            .storage()
+            .get_meeting_path(&meeting_id)
+            .expect("meeting path");
+        std::fs::remove_dir_all(&storage_path).expect("remove meeting directory");
+
+        let samples = vec![0.2; 16_000];
+        let result = daemon
+            .process_chunk_with_source_at(samples, AudioSource::Microphone, 0)
+            .await
+            .expect("chunk processing should continue");
+
+        assert!(result.is_some());
+        assert_eq!(daemon.state().chunks_processed(), 1);
+        assert_eq!(
+            daemon
+                .current_meeting
+                .as_ref()
+                .expect("in-memory meeting")
+                .transcript
+                .segments
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_chunk_with_source_uses_wall_clock_offset() {
+        let (mut daemon, _temp) =
+            create_test_meeting_daemon(false, Box::new(diarization::simple::SimpleDiarizer::new()));
+        let meeting_id = daemon
+            .start(Some("Wall Clock".to_string()))
+            .await
+            .expect("meeting start");
+
+        {
+            let meeting = daemon.current_meeting.as_mut().expect("meeting");
+            meeting.transcript.add_segment(TranscriptSegment::new(
+                99,
+                0,
+                1_000,
+                "earlier turn".to_string(),
+                0,
+            ));
+            meeting.transcript.total_chunks = 1;
+            meeting.metadata.chunk_count = 1;
+        }
+        daemon
+            .persist_current_meeting()
+            .expect("persist seed transcript");
+
+        daemon.state = MeetingState::Active {
+            started_at: Instant::now() - Duration::from_secs(10),
+            current_chunk: ChunkState::Recording {
+                started_at: Instant::now(),
+            },
+            chunks_processed: 1,
+        };
+
+        let samples = vec![0.2; 16_000];
+        let result = daemon
+            .process_chunk_with_source(samples, AudioSource::Microphone)
+            .await
+            .expect("process chunk")
+            .expect("segments");
+
+        assert_eq!(result.len(), 1);
+        assert!(result[0].start_ms >= 8_000);
+
+        let persisted = daemon
+            .storage()
+            .load_transcript(&meeting_id)
+            .expect("persisted transcript");
+        assert!(
+            persisted
+                .segments
+                .iter()
+                .any(|segment| segment.start_ms >= 8_000),
+            "expected a wall-clock timestamp in the persisted transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_cleans_up_even_if_final_persist_fails() {
+        let (mut daemon, _temp) =
+            create_test_meeting_daemon(false, Box::new(diarization::simple::SimpleDiarizer::new()));
+        let meeting_id = daemon
+            .start(Some("Stop Failure".to_string()))
+            .await
+            .expect("meeting start");
+
+        let storage_path = daemon
+            .storage()
+            .get_meeting_path(&meeting_id)
+            .expect("meeting path");
+        std::fs::remove_dir_all(&storage_path).expect("remove meeting directory");
+
+        let err = daemon
+            .stop()
+            .await
+            .expect_err("stop should report persist error");
+        assert!(err.to_string().contains("storage"));
+        assert!(daemon.state().is_idle());
+        assert!(daemon.current_meeting.is_none());
+        assert_eq!(daemon.next_segment_id, 0);
+    }
+
+    #[tokio::test]
+    async fn test_meeting_diarizer_resets_on_start_and_stop() {
+        let reset_calls = Arc::new(AtomicUsize::new(0));
+        let (mut daemon, _temp) = create_test_meeting_daemon(
+            false,
+            Box::new(ResetTrackingDiarizer::new(reset_calls.clone())),
+        );
+
+        daemon
+            .start(Some("First".to_string()))
+            .await
+            .expect("first start");
+        assert_eq!(reset_calls.load(Ordering::SeqCst), 1);
+
+        daemon.stop().await.expect("first stop");
+        assert_eq!(reset_calls.load(Ordering::SeqCst), 2);
+
+        daemon
+            .start(Some("Second".to_string()))
+            .await
+            .expect("second start");
+        assert_eq!(reset_calls.load(Ordering::SeqCst), 3);
     }
 }

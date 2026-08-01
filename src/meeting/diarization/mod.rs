@@ -5,9 +5,12 @@
 //! # Backends
 //!
 //! - **Simple**: Source-based attribution using mic vs loopback (Phase 2)
+//! - **Embedding**: Local speaker embeddings with online centroid matching
 //! - **ML**: ONNX-based speaker embeddings with clustering (Phase 3)
 //! - **Subprocess**: Memory-isolated ML diarization for resource-constrained systems
 
+#[cfg(feature = "speaker-embedding")]
+pub mod embedding;
 pub mod ml;
 pub mod simple;
 pub mod subprocess;
@@ -71,14 +74,18 @@ pub type SpeakerLabels = HashMap<SpeakerId, String>;
 pub trait Diarizer: Send + Sync {
     /// Process audio samples and return diarized segments
     fn diarize(
-        &self,
+        &mut self,
         samples: &[f32],
+        chunk_start_ms: u64,
         source: AudioSource,
         transcript_segments: &[crate::meeting::TranscriptSegment],
     ) -> Vec<DiarizedSegment>;
 
     /// Get the backend name
     fn name(&self) -> &'static str;
+
+    /// Reset any in-memory state before a new meeting starts.
+    fn reset(&mut self) {}
 }
 
 /// Diarization configuration
@@ -86,12 +93,20 @@ pub trait Diarizer: Send + Sync {
 pub struct DiarizationConfig {
     /// Enable diarization
     pub enabled: bool,
-    /// Backend to use: "simple", "ml", or "remote"
+    /// Backend to use: "simple", "embedding", "ml", or "remote"
     pub backend: String,
     /// Maximum number of speakers to detect
     pub max_speakers: u32,
+    /// Named embedding model to use when backend = "embedding"
+    pub model: String,
     /// Minimum segment duration in milliseconds
     pub min_segment_ms: u64,
+    /// Maximum audio window in seconds to feed into the embedding model
+    pub window_secs: f32,
+    /// Similarity threshold for confident speaker matches
+    pub confident_threshold: f32,
+    /// Similarity threshold for lower-confidence speaker matches
+    pub uncertain_threshold: f32,
     /// Path to ONNX model for ML backend
     pub model_path: Option<String>,
 }
@@ -102,7 +117,11 @@ impl Default for DiarizationConfig {
             enabled: true,
             backend: "simple".to_string(),
             max_speakers: 10,
+            model: "wespeaker-resnet221-lm".to_string(),
             min_segment_ms: 500,
+            window_secs: 1.5,
+            confident_threshold: 0.30,
+            uncertain_threshold: 0.15,
             model_path: None,
         }
     }
@@ -112,6 +131,31 @@ impl Default for DiarizationConfig {
 pub fn create_diarizer(config: &DiarizationConfig) -> Box<dyn Diarizer> {
     match config.backend.as_str() {
         "simple" => Box::new(simple::SimpleDiarizer::new()),
+        "embedding" => {
+            #[cfg(feature = "speaker-embedding")]
+            {
+                let mut diarizer = embedding::EmbeddingDiarizer::new(config);
+                if diarizer.model_exists() {
+                    if let Err(e) = diarizer.load_model() {
+                        tracing::warn!("Failed to load embedding diarization model: {}", e);
+                        tracing::info!("Falling back to simple diarization");
+                        return Box::new(simple::SimpleDiarizer::new());
+                    }
+                    tracing::info!("Using local embedding diarization");
+                    return Box::new(diarizer);
+                } else {
+                    tracing::warn!("Embedding diarization model not found, falling back to simple");
+                    return Box::new(simple::SimpleDiarizer::new());
+                }
+            }
+            #[cfg(not(feature = "speaker-embedding"))]
+            {
+                tracing::warn!(
+                    "Embedding diarization requires the 'speaker-embedding' feature, falling back to simple"
+                );
+                Box::new(simple::SimpleDiarizer::new())
+            }
+        }
         "ml" => {
             #[cfg(feature = "ml-diarization")]
             {
@@ -173,5 +217,7 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.backend, "simple");
         assert_eq!(config.max_speakers, 10);
+        assert_eq!(config.model, "wespeaker-resnet221-lm");
+        assert_eq!(config.window_secs, 1.5);
     }
 }

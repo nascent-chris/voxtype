@@ -460,23 +460,23 @@ pub async fn run_setup(
 
     let models_dir = Config::models_dir();
 
-    // Check if model_override is a Parakeet or SenseVoice model
+    // Check if model_override targets a non-Whisper model family
     let is_parakeet = model_override
         .map(model::is_parakeet_model)
         .unwrap_or(false);
     let is_sensevoice = model_override
         .map(model::is_sensevoice_model)
         .unwrap_or(false);
+    let is_speaker_embedding = model_override
+        .map(model::is_speaker_embedding_model)
+        .unwrap_or(false);
 
     // Use model_override if provided, otherwise use config default (for Whisper)
     let _model_name: &str = match model_override {
         Some(name) => {
-            // Validate the model name (check Whisper, Parakeet, and SenseVoice)
-            if !model::is_valid_model(name)
-                && !model::is_parakeet_model(name)
-                && !model::is_sensevoice_model(name)
-            {
-                let valid = model::valid_model_names().join(", ");
+            // Validate the model name for non-interactive setup.
+            if !model::is_setup_model_name(name) {
+                let valid = model::valid_setup_model_names().join(", ");
                 anyhow::bail!("Unknown model '{}'. Valid models are: {}", name, valid);
             }
             name
@@ -596,6 +596,53 @@ pub async fn run_setup(
                     "       Run: voxtype setup --download --model {}",
                     model_name
                 );
+            }
+        }
+    } else if is_speaker_embedding {
+        let model_name = model_override.unwrap(); // Safe: is_speaker_embedding implies Some
+
+        if !quiet {
+            println!("\nSpeaker embedding model (meeting diarization)...");
+        }
+
+        let dir_name = model::speaker_embedding_dir_name(model_name).unwrap();
+        let model_path = models_dir.join(dir_name);
+        let model_valid =
+            model_path.exists() && model::validate_speaker_embedding_model(&model_path).is_ok();
+
+        if model_valid {
+            if !quiet {
+                let size = std::fs::read_dir(&model_path)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter_map(|e| e.metadata().ok())
+                            .map(|m| m.len() as f64 / 1024.0 / 1024.0)
+                            .sum::<f64>()
+                    })
+                    .unwrap_or(0.0);
+                print_success(&format!("Model ready: {} ({:.0} MB)", model_name, size));
+            }
+        } else if download {
+            model::download_speaker_embedding_model(model_name)?;
+        } else if !quiet {
+            print_info(&format!("Model '{}' not downloaded yet", model_name));
+            println!(
+                "       Run: voxtype setup --download --model {}",
+                model_name
+            );
+        }
+
+        if !quiet {
+            println!(
+                "       Enable with [meeting.diarization] backend = \"embedding\", model = \"{}\"",
+                model_name
+            );
+
+            #[cfg(not(feature = "speaker-embedding"))]
+            {
+                print_warning("This build does not include the speaker-embedding backend yet.");
+                print_info("Rebuild with: cargo build --features speaker-embedding");
             }
         }
     } else {

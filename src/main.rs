@@ -106,10 +106,10 @@ async fn main() -> anyhow::Result<()> {
         config.output.restore_clipboard_delay_ms = delay;
     }
     let top_level_model = cli.model.clone();
-    if let Some(model) = cli.model {
-        if setup::model::is_valid_model(&model) {
-            config.whisper.model = model;
-        } else {
+    if let Some(model) = cli.model.as_deref() {
+        if setup::model::is_valid_model(model) {
+            config.whisper.model = model.to_string();
+        } else if !setup::model::is_recognized_model_name(model) {
             let default_model = &config.whisper.model;
             tracing::warn!(
                 "Unknown model '{}', using default model '{}'",
@@ -1222,8 +1222,8 @@ async fn show_config(config: &config::Config) -> anyhow::Result<()> {
             if path.is_dir() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.contains("sensevoice") {
-                    let has_model = path.join("model.int8.onnx").exists()
-                        || path.join("model.onnx").exists();
+                    let has_model =
+                        path.join("model.int8.onnx").exists() || path.join("model.onnx").exists();
                     let has_tokens = path.join("tokens.txt").exists();
                     if has_model && has_tokens {
                         sensevoice_models.push(name);
@@ -1344,6 +1344,17 @@ async fn run_meeting_command(config: &config::Config, action: MeetingAction) -> 
         },
         retain_audio: config.meeting.retain_audio,
         max_duration_mins: config.meeting.max_duration_mins,
+        diarization: meeting::diarization::DiarizationConfig {
+            enabled: config.meeting.diarization.enabled,
+            backend: config.meeting.diarization.backend.clone(),
+            max_speakers: config.meeting.diarization.max_speakers,
+            model: config.meeting.diarization.model.clone(),
+            min_segment_ms: config.meeting.diarization.min_segment_ms,
+            window_secs: config.meeting.diarization.window_secs,
+            confident_threshold: config.meeting.diarization.confident_threshold,
+            uncertain_threshold: config.meeting.diarization.uncertain_threshold,
+            model_path: config.meeting.diarization.model_path.clone(),
+        },
     };
 
     match action {
