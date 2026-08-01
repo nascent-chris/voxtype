@@ -45,6 +45,32 @@ sudo apt install wtype
 ./target/release/voxtype
 ```
 
+### Local NVIDIA + Parakeet
+
+If you are running from a local source checkout with an NVIDIA GPU and the Parakeet ONNX backend, use the dedicated guide:
+
+- [Local Parakeet CUDA Setup](docs/LOCAL_PARAKEET_CUDA.md)
+
+Short version:
+
+```bash
+./scripts/setup-local-parakeet-cuda.sh
+./scripts/run-local-parakeet-cuda.sh
+
+# If ydotool direct typing is too fast for an app:
+./scripts/run-local-parakeet-cuda.sh --type-delay 12
+
+# If multiple CUDA versions are installed:
+VOXTYPE_CUDA_HOME=/usr/local/cuda-12.8 ./scripts/run-local-parakeet-cuda.sh
+```
+
+For CPU-only Parakeet, build and run the separate CPU artifact:
+
+```bash
+CARGO_TARGET_DIR=target/parakeet-cpu cargo build --release --features parakeet
+./scripts/run-parakeet-cpu.sh
+```
+
 ### Compositor Keybindings
 
 Voxtype works best with your compositor's native keybindings. Add these to your compositor config:
