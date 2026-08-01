@@ -957,7 +957,10 @@ mod tests {
         transcript.recompact();
 
         assert_eq!(transcript.segments.len(), 1);
-        assert_eq!(transcript.segments[0].speaker_id.as_deref(), Some("SPEAKER_00"));
+        assert_eq!(
+            transcript.segments[0].speaker_id.as_deref(),
+            Some("SPEAKER_00")
+        );
         assert_eq!(transcript.segments[0].text, "hello world");
     }
 

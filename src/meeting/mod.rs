@@ -403,10 +403,14 @@ impl MeetingDaemon {
         if let Some(ref mut meeting) = self.current_meeting {
             if !self.config.diarization.enabled && matches!(source, AudioSource::Loopback) {
                 meeting.transcript.segments.extend(segments.iter().cloned());
-                meeting
-                    .transcript
-                    .segments
-                    .sort_by_key(|segment| (segment.start_ms, segment.end_ms, segment.chunk_id, segment.id));
+                meeting.transcript.segments.sort_by_key(|segment| {
+                    (
+                        segment.start_ms,
+                        segment.end_ms,
+                        segment.chunk_id,
+                        segment.id,
+                    )
+                });
             } else {
                 meeting.transcript.add_segments(segments.iter().cloned());
             }

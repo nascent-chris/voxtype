@@ -139,7 +139,8 @@ impl EmbeddingDiarizer {
     pub fn load_model(&mut self) -> Result<(), String> {
         let path = self.resolved_model_path();
         let threads = num_cpus::get().min(4);
-        let builder = Session::builder().map_err(|e| format!("ONNX session builder failed: {}", e))?;
+        let builder =
+            Session::builder().map_err(|e| format!("ONNX session builder failed: {}", e))?;
 
         #[cfg(feature = "speaker-embedding-cuda")]
         let builder = builder
