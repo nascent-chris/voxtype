@@ -783,7 +783,7 @@ mode = "clipboard"
 
 **Cause:** Typing too fast for the application.
 
-**Solution:** Increase typing delay:
+**Solution:** Increase typing delay, or leave it at `0` to use the output backend's default pacing:
 ```toml
 [output]
 type_delay_ms = 10  # Try 10-50ms

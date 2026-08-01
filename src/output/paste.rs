@@ -869,17 +869,24 @@ impl TextOutput for PasteOutput {
         };
         tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
 
-        // Step 2: Simulate paste keystroke
-        self.simulate_paste_keystroke().await?;
+        // Step 2: Simulate paste keystroke and auto-submit.
+        // Capture errors so we can still restore the clipboard before returning.
+        let paste_result = self.simulate_paste_keystroke().await;
 
-        // Send Enter key if configured
-        if self.auto_submit {
-            self.send_enter().await?;
+        if paste_result.is_ok() && self.auto_submit {
+            // Best-effort Enter; don't let it block clipboard restoration
+            if let Err(e) = self.send_enter().await {
+                tracing::warn!("Failed to send Enter after paste: {}", e);
+            }
         }
 
-        // Restore original clipboard content if we saved something
+        // Always restore original clipboard content, even if paste failed.
+        // The clipboard already contains our transcription text at this point,
+        // so leaving it dirty would silently destroy the user's clipboard.
         if let Some(content) = original_clipboard {
-            // Wait for paste to complete before restoring
+            // Wait for the target app to finish reading the clipboard.
+            // There's no Wayland protocol to know when an app completes a paste,
+            // so we use a configurable delay (default 200ms).
             tokio::time::sleep(std::time::Duration::from_millis(
                 self.restore_clipboard_delay_ms as u64,
             ))
@@ -894,6 +901,9 @@ impl TextOutput for PasteOutput {
                 }
             }
         }
+
+        // Now propagate any paste failure
+        paste_result?;
 
         tracing::info!(
             "Text pasted via clipboard + {} ({} chars)",

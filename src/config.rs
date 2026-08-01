@@ -169,7 +169,7 @@ fallback_to_clipboard = true
 # driver_order = ["wtype", "dotool", "ydotool", "clipboard"]
 
 # Delay between typed characters in milliseconds
-# 0 = fastest possible, increase if characters are dropped
+# 0 = use the output backend's default pacing; increase if characters are dropped or garbled
 type_delay_ms = 0
 
 # Automatically submit (send Enter key) after outputting transcribed text
@@ -181,11 +181,10 @@ type_delay_ms = 0
 # Useful for applications where Enter submits (e.g., Cursor IDE, Slack, Discord)
 # shift_enter_newlines = false
 
-# Restore clipboard content after paste mode (default: false)
+# Restore clipboard content after paste mode (default: true)
 # Saves clipboard before transcription, restores it after paste keystroke
-# Only applies to mode = "paste". Useful when you want to preserve your
-# existing clipboard content across dictation operations.
-# restore_clipboard = false
+# Only applies to mode = "paste".
+# restore_clipboard = true
 
 # Delay after paste before restoring clipboard (milliseconds)
 # Allows time for the paste operation to complete (default: 200)
@@ -1528,6 +1527,10 @@ fn default_post_process_timeout() -> u64 {
     30000 // 30 seconds - generous for LLM processing
 }
 
+fn default_restore_clipboard() -> bool {
+    true
+}
+
 fn default_restore_clipboard_delay() -> u32 {
     200 // 200ms - delay for paste to complete before restoring clipboard
 }
@@ -1552,7 +1555,7 @@ pub struct OutputConfig {
     #[serde(default)]
     pub notification: NotificationConfig,
 
-    /// Delay between typed characters (ms), 0 for fastest
+    /// Delay between typed characters (ms), 0 for output backend default pacing
     #[serde(default)]
     pub type_delay_ms: u32,
 
@@ -1628,7 +1631,7 @@ pub struct OutputConfig {
 
     /// Restore original clipboard content after paste mode completes
     /// Saves clipboard before transcription, restores it after paste keystroke
-    #[serde(default)]
+    #[serde(default = "default_restore_clipboard")]
     pub restore_clipboard: bool,
 
     /// Delay after paste before restoring clipboard content (milliseconds)
@@ -1801,7 +1804,7 @@ impl Default for Config {
                 dotool_xkb_variant: None,
                 file_path: None,
                 file_mode: FileMode::default(),
-                restore_clipboard: false,
+                restore_clipboard: true,
                 restore_clipboard_delay_ms: default_restore_clipboard_delay(),
             },
             engine: TranscriptionEngine::default(),
@@ -3571,7 +3574,7 @@ mod tests {
     #[test]
     fn test_restore_clipboard_defaults() {
         let config = Config::default();
-        assert!(!config.output.restore_clipboard);
+        assert!(config.output.restore_clipboard);
         assert_eq!(config.output.restore_clipboard_delay_ms, 200);
     }
 
@@ -3619,7 +3622,7 @@ mod tests {
         "#;
 
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(!config.output.restore_clipboard);
+        assert!(config.output.restore_clipboard);
         assert_eq!(config.output.restore_clipboard_delay_ms, 200);
     }
 }

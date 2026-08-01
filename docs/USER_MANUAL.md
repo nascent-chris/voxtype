@@ -309,7 +309,7 @@ mode = "type"
 fallback_to_clipboard = true
 
 # Delay between typed characters in milliseconds
-# 0 = fastest, increase if characters are dropped
+# 0 = backend default pacing; increase if characters are dropped or garbled
 type_delay_ms = 0
 
 [output.notification]

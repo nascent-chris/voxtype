@@ -95,6 +95,31 @@ impl YdotoolOutput {
             .status()
             .await;
     }
+
+    /// Build arguments for `ydotool type`.
+    ///
+    /// When type_delay_ms is zero, omit delay flags so ydotool keeps its own
+    /// default pacing. Forcing zero delay can overwhelm some applications and
+    /// cause characters to be reordered or inserted at stale cursor positions.
+    fn type_args(&self, text: &str) -> Vec<String> {
+        let mut args = vec!["type".to_string()];
+
+        if self.type_delay_ms > 0 {
+            args.push("--key-delay".to_string());
+            args.push(self.type_delay_ms.to_string());
+
+            // Use --key-hold only if supported (older versions silently ignore unknown flags)
+            if self.supports_key_hold {
+                args.push("--key-hold".to_string());
+                args.push(self.type_delay_ms.to_string());
+            }
+        }
+
+        // The -- ensures text starting with - isn't treated as an option
+        args.push("--".to_string());
+        args.push(text.to_string());
+        args
+    }
 }
 
 #[async_trait::async_trait]
@@ -113,32 +138,28 @@ impl TextOutput for YdotoolOutput {
             tokio::time::sleep(Duration::from_millis(self.pre_type_delay_ms as u64)).await;
         }
 
-        let mut cmd = Command::new("ydotool");
-        cmd.arg("type");
-
-        // Always set delay explicitly (ydotool defaults to 12ms if not specified)
-        cmd.arg("--key-delay").arg(self.type_delay_ms.to_string());
-
-        // Use --key-hold only if supported (older versions silently ignore unknown flags)
-        if self.supports_key_hold {
-            cmd.arg("--key-hold").arg(self.type_delay_ms.to_string());
-        }
-
-        // The -- ensures text starting with - isn't treated as an option
-        cmd.arg("--").arg(text);
+        let args = self.type_args(text);
 
         tracing::debug!(
-            "Running: ydotool type --key-delay {} {} -- \"{}\"",
-            self.type_delay_ms,
-            if self.supports_key_hold {
-                format!("--key-hold {}", self.type_delay_ms)
+            "Running: ydotool {} \"{}\"",
+            if self.type_delay_ms > 0 {
+                format!(
+                    "type --key-delay {}{} --",
+                    self.type_delay_ms,
+                    if self.supports_key_hold {
+                        format!(" --key-hold {}", self.type_delay_ms)
+                    } else {
+                        String::new()
+                    }
+                )
             } else {
-                String::new()
+                "type --".to_string()
             },
             text.chars().take(20).collect::<String>()
         );
 
-        let output = cmd
+        let output = Command::new("ydotool")
+            .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
@@ -165,19 +186,10 @@ impl TextOutput for YdotoolOutput {
 
         // Append text if configured (e.g., a space to separate sentences)
         if let Some(ref append) = self.append_text {
-            let mut append_cmd = Command::new("ydotool");
-            append_cmd.arg("type");
-            append_cmd
-                .arg("--key-delay")
-                .arg(self.type_delay_ms.to_string());
-            if self.supports_key_hold {
-                append_cmd
-                    .arg("--key-hold")
-                    .arg(self.type_delay_ms.to_string());
-            }
-            append_cmd.arg("--").arg(append);
+            let append_args = self.type_args(append);
 
-            let append_output = append_cmd
+            let append_output = Command::new("ydotool")
+                .args(&append_args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .output()
@@ -284,5 +296,61 @@ mod tests {
     fn test_detect_key_hold_support() {
         // This test will pass regardless of ydotool version - it just shouldn't panic
         let _supports = YdotoolOutput::detect_key_hold_support();
+    }
+
+    #[test]
+    fn test_type_args_zero_delay_uses_ydotool_defaults() {
+        let output = YdotoolOutput {
+            type_delay_ms: 0,
+            pre_type_delay_ms: 0,
+            notify: false,
+            supports_key_hold: true,
+            auto_submit: false,
+            append_text: None,
+        };
+
+        assert_eq!(output.type_args("Hello"), vec!["type", "--", "Hello"]);
+    }
+
+    #[test]
+    fn test_type_args_with_delay_and_key_hold() {
+        let output = YdotoolOutput {
+            type_delay_ms: 10,
+            pre_type_delay_ms: 0,
+            notify: false,
+            supports_key_hold: true,
+            auto_submit: false,
+            append_text: None,
+        };
+
+        assert_eq!(
+            output.type_args("Hello"),
+            vec![
+                "type",
+                "--key-delay",
+                "10",
+                "--key-hold",
+                "10",
+                "--",
+                "Hello"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_type_args_with_delay_without_key_hold() {
+        let output = YdotoolOutput {
+            type_delay_ms: 10,
+            pre_type_delay_ms: 0,
+            notify: false,
+            supports_key_hold: false,
+            auto_submit: false,
+            append_text: None,
+        };
+
+        assert_eq!(
+            output.type_args("Hello"),
+            vec!["type", "--key-delay", "10", "--", "Hello"]
+        );
     }
 }

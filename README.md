@@ -156,7 +156,7 @@ translate = false   # Translate non-English speech to English
 [output]
 mode = "type"       # "type", "clipboard", or "paste"
 fallback_to_clipboard = true
-type_delay_ms = 0   # Increase if characters are dropped
+type_delay_ms = 0   # Backend default pacing; increase if characters are dropped or garbled
 # auto_submit = true  # Send Enter after transcription (for chat apps, terminals)
 # Note: "paste" mode copies to clipboard then simulates Ctrl+V
 #       Useful for non-US keyboard layouts where ydotool typing fails
@@ -557,7 +557,7 @@ aplay test.wav
 
 ### Text appears slowly
 
-If characters are being dropped, increase the delay:
+If characters are being dropped or garbled, increase the delay:
 
 ```toml
 [output]
