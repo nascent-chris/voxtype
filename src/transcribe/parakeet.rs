@@ -55,8 +55,10 @@ impl ParakeetTranscriber {
         );
         let start = std::time::Instant::now();
 
-        // Configure execution provider based on feature flags
-        let exec_config = build_execution_config();
+        // Configure execution provider based on feature flags, with thread count
+        let threads = config.threads.unwrap_or_else(|| num_cpus::get().min(8));
+        tracing::info!("Parakeet using {} inference threads", threads);
+        let exec_config = build_execution_config(threads);
 
         let model = match model_type {
             ParakeetModelType::Ctc => {
@@ -169,16 +171,25 @@ impl Transcriber for ParakeetTranscriber {
     }
 }
 
-/// Build execution config based on compile-time feature flags
-fn build_execution_config() -> Option<ExecutionConfig> {
+/// Build execution config based on compile-time feature flags and thread count
+fn build_execution_config(threads: usize) -> Option<ExecutionConfig> {
     #[cfg(feature = "parakeet-cuda")]
     {
         if probe_cuda_runtime() {
             tracing::info!("Configuring CUDA execution provider for NVIDIA GPU acceleration");
-            return Some(ExecutionConfig::new().with_execution_provider(ExecutionProvider::Cuda));
+            return Some(
+                ExecutionConfig::new()
+                    .with_execution_provider(ExecutionProvider::Cuda)
+                    .with_intra_threads(threads)
+                    .with_inter_threads(1),
+            );
         }
         tracing::warn!("CUDA not available or incompatible, falling back to CPU inference");
-        return None;
+        return Some(
+            ExecutionConfig::new()
+                .with_intra_threads(threads)
+                .with_inter_threads(1),
+        );
     }
 
     #[cfg(feature = "parakeet-tensorrt")]
@@ -186,17 +197,29 @@ fn build_execution_config() -> Option<ExecutionConfig> {
         if probe_cuda_runtime() {
             tracing::info!("Configuring TensorRT execution provider for NVIDIA GPU acceleration");
             return Some(
-                ExecutionConfig::new().with_execution_provider(ExecutionProvider::TensorRT),
+                ExecutionConfig::new()
+                    .with_execution_provider(ExecutionProvider::TensorRT)
+                    .with_intra_threads(threads)
+                    .with_inter_threads(1),
             );
         }
         tracing::warn!("CUDA not available or incompatible, falling back to CPU inference");
-        return None;
+        return Some(
+            ExecutionConfig::new()
+                .with_intra_threads(threads)
+                .with_inter_threads(1),
+        );
     }
 
     #[cfg(feature = "parakeet-rocm")]
     {
         tracing::info!("Configuring ROCm execution provider for AMD GPU acceleration");
-        return Some(ExecutionConfig::new().with_execution_provider(ExecutionProvider::ROCm));
+        return Some(
+            ExecutionConfig::new()
+                .with_execution_provider(ExecutionProvider::ROCm)
+                .with_intra_threads(threads)
+                .with_inter_threads(1),
+        );
     }
 
     #[cfg(not(any(
@@ -205,7 +228,11 @@ fn build_execution_config() -> Option<ExecutionConfig> {
         feature = "parakeet-rocm"
     )))]
     {
-        None
+        Some(
+            ExecutionConfig::new()
+                .with_intra_threads(threads)
+                .with_inter_threads(1),
+        )
     }
 }
 

@@ -123,6 +123,11 @@ on_demand_loading = false
 # Auto-detected from model directory if not specified
 # model_type = "tdt"
 #
+# Number of CPU threads for ONNX Runtime inference
+# Used for CPU-only builds or when GPU is unavailable (CUDA/ROCm fallback)
+# Defaults to number of physical cores (capped at 8) if not specified
+# threads = 8
+#
 # on_demand_loading = false
 
 [output]

@@ -937,6 +937,11 @@ pub struct ParakeetConfig {
     #[serde(default)]
     pub model_type: Option<ParakeetModelType>,
 
+    /// Number of CPU threads for ONNX Runtime inference (used for CPU fallback or CPU-only builds)
+    /// Defaults to number of physical cores (capped at 8) if not specified
+    #[serde(default)]
+    pub threads: Option<usize>,
+
     /// Load model on-demand when recording starts (true) or keep loaded (false)
     #[serde(default = "default_on_demand_loading")]
     pub on_demand_loading: bool,
@@ -947,6 +952,7 @@ impl Default for ParakeetConfig {
         Self {
             model: "parakeet-tdt-0.6b-v3".to_string(),
             model_type: None, // Auto-detect
+            threads: None,
             on_demand_loading: false,
         }
     }
@@ -3103,6 +3109,7 @@ mod tests {
         let config = ParakeetConfig::default();
         assert_eq!(config.model, "parakeet-tdt-0.6b-v3");
         assert!(config.model_type.is_none());
+        assert!(config.threads.is_none());
         assert!(!config.on_demand_loading);
     }
 
